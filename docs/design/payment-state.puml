@@ -1,0 +1,63 @@
+@startuml
+title PayLink - Payment State Diagram
+skinparam shadowing false
+hide empty description
+
+[*] --> Initiated : payment request accepted
+
+state Initiated
+state FundsHeld
+state SentToBiller
+state Unknown
+state Failed
+state Completed
+state Rejected
+state Refunded
+
+Initiated --> FundsHeld : fraud approved / funds available\n[hold succeeds]
+Initiated --> Rejected : fraud rejected or insufficient funds
+
+FundsHeld --> SentToBiller : submit payment to biller
+FundsHeld --> Failed : submission prevented / definitive failure\n[release held funds]
+
+SentToBiller --> Completed : biller confirms success\n[capture held funds]
+SentToBiller --> Failed : biller definitively refuses\n[release held funds]
+SentToBiller --> Unknown : no response within 10 seconds\n[keep funds held]
+
+Unknown --> Completed : late callback / status inquiry /\nreconciliation confirms success\n[capture held funds]
+Unknown --> Failed : authoritative refusal or\nreconciliation confirms no payment\n[release held funds]
+
+Completed --> Refunded : approved completed-payment refund\n[credit refund once]
+
+Rejected --> [*]
+Failed --> [*]
+Completed --> [*]
+Refunded --> [*]
+
+note right of Initiated
+    Validate amount: 5..10,000 EGP.
+    Check account, daily limit and velocity.
+    Basic daily limit: 5,000 EGP.
+    Verified daily limit: 30,000 EGP.
+end note
+
+note right of Unknown
+    Funds remain held.
+    Status inquiry only at +1, +5, +15 minutes.
+    Never resubmit the payment.
+    If still unresolved, remain Unknown until
+    definitive callback or reconciliation evidence.
+end note
+
+note bottom of Failed
+    Failed payment releases held funds.
+    This is not a refund of a Completed payment.
+end note
+
+note bottom of Completed
+    Terminal for ordinary bill-payment processing.
+    Only the separately approved refund flow
+    may transition it to Refunded.
+end note
+
+@enduml

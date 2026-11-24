@@ -1,0 +1,340 @@
+@startuml
+title PayLink - Database ERD (Logical Model)
+skinparam shadowing false
+hide circle
+
+entity "accounts" as accounts {
+    * account_id : UUID <<PK>>
+    --
+    role : AccountRole
+    verification_level : VerificationLevel
+    created_at : timestamp
+}
+
+entity "account_blocks" as account_blocks {
+    * block_id : UUID <<PK>>
+    --
+    account_id : UUID <<FK>>
+    reason : BlockReason
+    blocked_at : timestamp
+    blocked_until : timestamp?
+    blocked_by : UUID?
+    unblocked_at : timestamp?
+}
+
+entity "wallets" as wallets {
+    * wallet_id : UUID <<PK>>
+    --
+    account_id : UUID <<FK, UQ>>
+    created_at : timestamp
+}
+
+entity "ledger_entries" as ledger_entries {
+    * entry_id : UUID <<PK>>
+    --
+    movement_id : UUID <<UQ>>
+    wallet_id : UUID <<FK>>
+    payment_id : UUID? <<FK>>
+    top_up_id : UUID? <<FK>>
+    type : LedgerEntryType
+    bucket : BalanceBucket
+    amount : Decimal
+    currency : String
+    created_by : UUID
+    reason : String
+    created_at : timestamp
+}
+
+entity "top_ups" as top_ups {
+    * top_up_id : UUID <<PK>>
+    --
+    wallet_id : UUID <<FK>>
+    method : TopUpMethod
+    amount : Decimal
+    currency : String
+    agent_account_id : UUID? <<FK>>
+    status : TopUpStatus
+    gateway_reference : String?
+    created_at : timestamp
+}
+
+entity "billers" as billers {
+    * biller_id : UUID <<PK>>
+    --
+    code : String <<UQ>>
+    name : String
+    protocol : BillerProtocol
+    active : Boolean
+}
+
+entity "biller_services" as biller_services {
+    * service_id : UUID <<PK>>
+    --
+    biller_id : UUID <<FK>>
+    name : String
+    category : BillerCategory
+    min_amount : Decimal
+    max_amount : Decimal
+    active : Boolean
+}
+
+entity "service_input_fields" as service_input_fields {
+    * field_id : UUID <<PK>>
+    --
+    service_id : UUID <<FK>>
+    field_name : String
+    label : String
+    data_type : String
+    validation_pattern : String?
+    required : Boolean
+}
+
+entity "payments" as payments {
+    * payment_id : UUID <<PK>>
+    --
+    reference : String <<UQ>>
+    customer_account_id : UUID <<FK>>
+    agent_account_id : UUID? <<FK>>
+    wallet_id : UUID <<FK>>
+    biller_service_id : UUID <<FK>>
+    biller_account_ref : String
+    biller_reference : String?
+    idempotency_key : String
+    bill_amount : Decimal
+    service_fee : Decimal
+    total_amount : Decimal
+    currency : String
+    state : PaymentState
+    reason : String?
+    created_at : timestamp
+    updated_at : timestamp
+    --
+    UQ(customer_account_id, idempotency_key)
+}
+
+entity "payment_status_history" as payment_status_history {
+    * history_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK>>
+    from_state : String?
+    to_state : String
+    event : String
+    source : String
+    reason : String?
+    occurred_at : timestamp
+}
+
+entity "status_inquiry_attempts" as status_inquiry_attempts {
+    * attempt_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK>>
+    attempt_number : Integer
+    scheduled_for : timestamp
+    executed_at : timestamp?
+    result : AttemptResult
+    --
+    UQ(payment_id, attempt_number)
+}
+
+entity "refund_requests" as refund_requests {
+    * refund_request_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK>>
+    requested_by : UUID <<FK accounts>>
+    status : RefundStatus
+    decided_by : UUID? <<FK accounts>>
+    decision_reason : String?
+    created_at : timestamp
+    decided_at : timestamp?
+    processed_at : timestamp?
+}
+
+entity "payment_events" as payment_events {
+    * event_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK>>
+    type : PaymentEventType
+    occurred_at : timestamp
+}
+
+entity "biller_callback_logs" as biller_callback_logs {
+    * callback_id : UUID <<PK>>
+    --
+    biller_code : String
+    payment_reference : String
+    payload : Text
+    outcome : CallbackOutcome
+    received_at : timestamp
+}
+
+entity "fee_rules" as fee_rules {
+    * rule_id : UUID <<PK>>
+    --
+    biller_service_id : UUID <<FK>>
+    strategy_type : FeeStrategyType
+    fixed_amount : Decimal?
+    percentage_rate : Decimal?
+    minimum_fee : Decimal?
+    active : Boolean
+}
+
+entity "fee_tiers" as fee_tiers {
+    * fee_tier_id : UUID <<PK>>
+    --
+    rule_id : UUID <<FK>>
+    up_to_amount : Decimal?
+    fee : Decimal
+}
+
+entity "promotions" as promotions {
+    * promotion_id : UUID <<PK>>
+    --
+    biller_id : UUID <<FK>>
+    start_date : date
+    end_date : date
+    active : Boolean
+    fee_waived : Boolean
+}
+
+entity "commissions" as commissions {
+    * commission_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK, UQ>>
+    agent_account_id : UUID <<FK accounts>>
+    amount : Decimal
+    currency : String
+    credited_at : timestamp
+}
+
+entity "notifications" as notifications {
+    * notification_id : UUID <<PK>>
+    --
+    payment_id : UUID <<FK>>
+    recipient_account_id : UUID <<FK>>
+    channel : NotificationChannel
+    template_code : String
+    message : Text
+    status : NotificationStatus
+    attempts : Integer
+    last_attempt_at : timestamp?
+    created_at : timestamp
+}
+
+entity "notification_templates" as notification_templates {
+    * template_code : String <<PK>>
+    --
+    event_type : PaymentEventType
+    channel : NotificationChannel
+    body : Text
+}
+
+entity "settlement_files" as settlement_files {
+    * file_id : UUID <<PK>>
+    --
+    biller_code : String
+    business_date : date
+    imported_at : timestamp
+}
+
+entity "settlement_records" as settlement_records {
+    * record_id : UUID <<PK>>
+    --
+    file_id : UUID <<FK>>
+    payment_reference : String
+    amount : Decimal
+    currency : String
+    reported_status : String
+}
+
+entity "reconciliation_reports" as reconciliation_reports {
+    * report_id : UUID <<PK>>
+    --
+    business_date : date
+    generated_at : timestamp
+}
+
+entity "reconciliation_differences" as reconciliation_differences {
+    * difference_id : UUID <<PK>>
+    --
+    report_id : UUID <<FK>>
+    payment_id : UUID? <<FK>>
+    payment_reference : String
+    type : DifferenceType
+    paylink_state : String?
+    biller_status : String?
+    review_status : ReviewStatus
+    reviewed_by : UUID? <<FK accounts>>
+}
+
+entity "audit_log_entries" as audit_log_entries {
+    * audit_id : UUID <<PK>>
+    --
+    actor_id : UUID
+    actor_role : AccountRole
+    action : String
+    entity_type : String
+    entity_id : String
+    reason : String
+    old_value : Text?
+    new_value : Text?
+    occurred_at : timestamp
+}
+
+entity "configuration_items" as configuration_items {
+    * key : String <<PK>>
+    --
+    value : String
+    updated_by : UUID <<FK accounts>>
+    updated_at : timestamp
+}
+
+accounts ||--|| wallets : owns
+accounts ||--o{ account_blocks : has
+wallets ||--o{ ledger_entries : records
+wallets ||--o{ top_ups : receives
+accounts ||--o{ top_ups : agent performs
+billers ||--|{ biller_services : offers
+biller_services ||--o{ service_input_fields : requires
+accounts ||--o{ payments : customer
+accounts |o--o{ payments : agent
+wallets ||--o{ payments : funds
+biller_services ||--o{ payments : billed by
+payments ||--o{ payment_status_history : history
+payments ||--o{ status_inquiry_attempts : inquiries
+payments ||--o{ refund_requests : refund requests
+accounts ||--o{ refund_requests : requests
+accounts |o--o{ refund_requests : decides
+payments ||--o{ payment_events : emits
+payments ||--o{ ledger_entries : financial movements
+top_ups |o--o{ ledger_entries : top-up movements
+biller_services ||--o{ fee_rules : fee rules
+fee_rules ||--o{ fee_tiers : tiers
+billers ||--o{ promotions : promotions
+payments ||--o| commissions : may earn
+accounts ||--o{ commissions : agent receives
+payments ||--o{ notifications : triggers
+accounts ||--o{ notifications : receives
+notification_templates ||--o{ notifications : template
+settlement_files ||--o{ settlement_records : contains
+reconciliation_reports ||--o{ reconciliation_differences : reports
+payments |o--o{ reconciliation_differences : matched payment
+accounts |o--o{ reconciliation_differences : reviews
+accounts ||--o{ configuration_items : updates
+
+note bottom of wallets
+    Available and held balances are derived from ledger entries;
+    do not store a mutable balance as the source of truth.
+end note
+
+note bottom of payments
+    Store exact decimal amounts and currency.
+    Enforce unique (customer_account_id, idempotency_key).
+    State transitions are validated by the domain model.
+end note
+
+note bottom of ledger_entries
+    Ledger is append-only. Each financial movement is atomic
+    and idempotent, identified by movement_id.
+end note
+
+@enduml

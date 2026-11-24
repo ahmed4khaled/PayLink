@@ -1,0 +1,202 @@
+@startuml
+title PayLink - Use Case Diagram
+left to right direction
+skinparam shadowing false
+skinparam nodesep 10
+skinparam ranksep 70
+
+' ---------- Primary actors ----------
+actor "Customer" as Customer
+actor "Agent" as Agent
+actor "Administrator" as Admin
+actor "Support Employee" as Support
+actor "Scheduler\n(system timer)" as Timer
+
+' ---------- Secondary actors ----------
+actor "Payment Provider\n(simulated card)" as CardProvider
+actor "Biller System\n(ElectroCo, AquaCo, TopUpNet)" as Biller
+actor "NetCo\n(optional batch biller)" as NetCo
+actor "Notification Provider\n(SMS / Push / Email)" as NotifProvider
+
+rectangle "PayLink System" {
+  usecase "Log In" as UC_Login
+  usecase "Register Account" as UC_Register
+  usecase "Upgrade Verification Level" as UC_Upgrade
+  usecase "View Wallet Balance" as UC_Balance
+  usecase "View Transaction History" as UC_History
+  usecase "Top Up Wallet by Card" as UC_TopUpCard
+  usecase "Top Up Wallet through Agent" as UC_TopUpAgent
+
+  usecase "Browse Billers and Services" as UC_Browse
+  usecase "Inquire Bill" as UC_Inquire
+  usecase "View Fees and Total Amount" as UC_ViewFees
+  usecase "Calculate Service Fee" as UC_Fee
+
+  usecase "Pay Bill" as UC_Pay
+  usecase "Validate Payment Request\n(service range and idempotency)" as UC_Validate
+  usecase "Perform Fraud Checks\n(single limit, daily limit,\nvelocity, blocked)" as UC_Fraud
+  usecase "Hold Wallet Funds" as UC_Hold
+  usecase "Submit Payment to Biller" as UC_Submit
+  usecase "Capture Held Funds\nafter Successful Payment" as UC_Capture
+  usecase "Receive Biller Callback\n(TopUpNet)" as UC_Callback
+  usecase "Retry Unknown Payment" as UC_Retry
+  usecase "Inquire Biller Payment Status" as UC_StatusInquiry
+  usecase "Release Held Funds\n(after confirmed failure)" as UC_Release
+  usecase "Credit Agent Commission" as UC_Commission
+  usecase "Track Payment Status" as UC_Track
+
+  usecase "Send Payment Notification" as UC_Notify
+  usecase "Deliver Notification" as UC_Deliver
+  usecase "Retry Failed Notification" as UC_NotifyRetry
+
+  usecase "Submit Refund Request\n(completed payment)" as UC_RefundReq
+  usecase "Review Refund Request" as UC_RefundReview
+  usecase "Approve or Reject Refund" as UC_RefundDecide
+  usecase "Process Approved Refund\n(credit customer wallet)" as UC_ProcessRefund
+
+  usecase "Manage Billers and Services" as UC_ManageBillers
+  usecase "Configure Fees, Limits\nand Promotions" as UC_ConfigFees
+  usecase "View Daily Statistics" as UC_Stats
+  usecase "Search Payment by Reference\n(full history)" as UC_Search
+  usecase "Block or Unblock Account" as UC_Block
+
+  usecase "Reconcile Payment Records" as UC_Reconcile
+  usecase "Import Settlement Data" as UC_Import
+  usecase "Review Reconciliation Reports" as UC_ReviewReport
+}
+
+' ---------- Actor associations ----------
+Customer -- UC_Login
+Agent -- UC_Login
+Admin -- UC_Login
+Support -- UC_Login
+
+Customer -- UC_Register
+Customer -- UC_Upgrade
+Customer -- UC_Balance
+Customer -- UC_History
+Customer -- UC_TopUpCard
+Customer -- UC_TopUpAgent
+Customer -- UC_Browse
+Customer -- UC_Inquire
+Customer -- UC_ViewFees
+Customer -- UC_Pay
+Customer -- UC_Track
+Customer -- UC_RefundReq
+Customer -- UC_Deliver
+
+Agent -- UC_TopUpAgent
+Agent -- UC_Browse
+Agent -- UC_Inquire
+Agent -- UC_ViewFees
+Agent -- UC_Pay
+Agent -- UC_Commission
+
+Admin -- UC_ManageBillers
+Admin -- UC_ConfigFees
+Admin -- UC_Stats
+
+Support -- UC_Search
+Support -- UC_Block
+Support -- UC_RefundReview
+Support -- UC_ReviewReport
+
+Timer -- UC_Retry
+Timer -- UC_Reconcile
+Timer -- UC_NotifyRetry
+
+UC_TopUpCard -- CardProvider
+UC_Inquire -- Biller
+UC_Submit -- Biller
+UC_StatusInquiry -- Biller
+UC_Callback -- Biller
+UC_Import -- Biller
+UC_Submit -- NetCo
+UC_Import -- NetCo
+UC_Deliver -- NotifProvider
+
+' ---------- Include / extend ----------
+UC_Pay ..> UC_Validate : <<include>>
+UC_Pay ..> UC_Fraud : <<include>>
+UC_Pay ..> UC_Fee : <<include>>
+UC_Pay ..> UC_Hold : <<include>>
+UC_Pay ..> UC_Submit : <<include>>
+
+UC_ViewFees ..> UC_Fee : <<include>>
+
+UC_Capture ..> UC_Pay : <<extend>>\n[payment Completed,\nimmediately or later]
+UC_Release ..> UC_Pay : <<extend>>\n[payment Failed,\nimmediately or later]
+UC_Commission ..> UC_Pay : <<extend>>\n[agent-assisted, Completed]
+UC_Notify ..> UC_Pay : <<extend>>\n[Completed, Failed,\nRejected or Refunded]
+
+UC_Callback ..> UC_Submit : <<extend>>\n[async biller]
+UC_Retry ..> UC_StatusInquiry : <<include>>
+
+UC_Notify ..> UC_Deliver : <<include>>
+UC_NotifyRetry ..> UC_Deliver : <<extend>>\n[delivery failed]
+
+UC_RefundReview ..> UC_RefundDecide : <<include>>
+UC_ProcessRefund ..> UC_RefundDecide : <<extend>>\n[refund Approved]
+
+UC_Reconcile ..> UC_Import : <<include>>
+
+' ---------- Notes ----------
+note as N1
+  <b>Pay Bill:</b> validates the service amount range
+  and the idempotency key.
+  Fraud checks enforce the single-payment limit
+  (5 - 10,000 EGP), daily limits and velocity rules.
+  No answer from a live biller in 10 seconds:
+  payment becomes Unknown and funds stay held.
+  Biller confirms: held funds are captured.
+end note
+
+note as N2
+  <b>Retry Unknown Payment:</b> re-queries the biller
+  after 1, 5 and 15 minutes.
+  It never re-sends the payment.
+  If all attempts fail to obtain a definitive result,
+  payment stays Unknown and funds stay held
+  until reconciliation provides evidence.
+end note
+
+note as N3
+  <b>Reconcile Payment Records:</b> settlement or
+  result-file evidence can resolve Unknown payments
+  to Completed or Failed.
+  Differences are flagged in the report.
+  Late confirmation (callback, retry, settlement)
+  triggers capture or release, commission
+  and notification as applicable.
+end note
+
+note as N4
+  <b>Cross-cutting rules:</b> every money movement
+  (hold, capture, release, top-up, commission, refund)
+  creates a ledger entry.
+  Every money movement and admin action
+  (billers, fees, limits, account blocks)
+  is written to the audit log.
+end note
+
+note as N5
+  <b>Upgrade Verification Level:</b>
+  approval actor is not defined in the brief (AQ-02).
+end note
+
+note as N6
+  Releasing a failed payment hold is not the same
+  as refunding a previously completed payment.
+  The completed-payment refund requires a request,
+  support review and approval.
+end note
+
+note as N7
+  Payment notifications are triggered by payment
+  lifecycle events, including late outcomes received
+  through callbacks, retries or reconciliation.
+  Notification delivery is independent of payment
+  processing.
+end note
+
+@enduml

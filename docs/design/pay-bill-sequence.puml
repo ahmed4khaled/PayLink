@@ -1,0 +1,157 @@
+@startuml
+title PayLink - Pay Bill Sequence Diagram
+skinparam shadowing false
+autonumber
+
+actor Customer
+actor Agent
+participant "Payment API" as API
+participant "PaymentService" as PS
+participant "AccountService" as AS
+participant "FraudRuleHandler\n(Chain of Responsibility)" as Fraud
+participant "FeeCalculator" as Fee
+participant "WalletService" as Wallet
+participant "BillerAdapterFactory" as Factory
+participant "BillerAdapter" as Biller
+participant "PaymentEventPublisher" as Events
+participant "NotificationService" as Notify
+participant "RetryScheduler" as Scheduler
+database "PayLink Database" as DB
+
+alt Customer-initiated payment
+    Customer -> API : Pay bill(request)
+else Agent-assisted payment
+    Agent -> API : Submit payment for customer
+end
+
+API -> PS : payBill(request)
+PS -> DB : Find payment by customer + idempotency key
+DB --> PS : Existing payment? / none
+
+alt Existing request with same key and same payload
+    PS --> API : Return original payment
+    API --> Customer : Existing payment status
+else Same key with different payload
+    PS --> API : Idempotency conflict
+    API --> Customer : Reject conflicting request
+else New payment
+    PS -> DB : Load account, wallet, service, configuration
+    DB --> PS : Account and service data
+    PS -> AS : Check account status / verification
+    AS --> PS : Account status
+    PS -> Fraud : Evaluate context
+    Fraud -> Fraud : Account status rule
+    Fraud -> Fraud : Single payment limit rule
+    Fraud -> Fraud : Daily limit rule
+    Fraud -> Fraud : Velocity rule
+    Fraud --> PS : FraudDecision
+
+    alt Fraud rejected
+        PS -> DB : Save Payment as Rejected + status history
+        PS -> Events : Publish REJECTED event
+        Events -> Notify : onPaymentEvent(REJECTED)
+        Notify -> DB : Create and deliver notification
+        PS --> API : Rejected payment
+        API --> Customer : Payment rejected
+    else Fraud approved
+        PS -> Fee : quote(service, billAmount, date)
+        Fee --> PS : FeeQuote
+        PS -> DB : Create Payment (Initiated)
+        PS -> Wallet : holdFunds(walletId, paymentId, totalAmount)
+        Wallet -> DB : Atomic ledger entries\nAVAILABLE -total / HELD +total
+        DB --> Wallet : Hold recorded
+        Wallet --> PS : Hold successful
+        PS -> DB : Transition Initiated -> FundsHeld
+        PS -> DB : Transition FundsHeld -> SentToBiller
+        PS -> Factory : getAdapter(billerCode)
+        Factory --> PS : BillerAdapter
+        PS -> Biller : submitPayment(paymentReference, accountRef, billAmount)
+
+        alt Biller confirms within 10 seconds
+            Biller --> PS : CONFIRMED + billerReference
+            PS -> DB : Save biller outcome
+            PS -> Wallet : captureFunds(paymentId)
+            Wallet -> DB : Atomic ledger movement\nHELD debit + capture entries
+            DB --> Wallet : Capture recorded
+            Wallet --> PS : Captured
+            PS -> PS : State -> Completed
+            PS -> DB : Save status history + payment event
+            PS -> Events : Publish COMPLETED event
+            Events -> Notify : onPaymentEvent(COMPLETED)
+            Notify -> DB : Create notification\n(send/retry independently)
+
+            opt Agent-assisted payment
+                PS -> PS : Calculate 40% of service fee
+                PS -> Wallet : Credit agent commission once
+                Wallet -> DB : Append COMMISSION ledger entry
+            end
+
+            PS --> API : Completed payment
+            API --> Customer : Payment completed
+
+        else Biller refuses within 10 seconds
+            Biller --> PS : REFUSED + reason
+            PS -> DB : Save biller outcome
+            PS -> Wallet : releaseFunds(paymentId)
+            Wallet -> DB : Atomic ledger movement\nHELD debit / AVAILABLE credit
+            DB --> Wallet : Release recorded
+            Wallet --> PS : Released
+            PS -> PS : State -> Failed
+            PS -> DB : Save status history + payment event
+            PS -> Events : Publish FAILED event
+            Events -> Notify : onPaymentEvent(FAILED)
+            Notify -> DB : Create notification
+            PS --> API : Failed payment
+            API --> Customer : Payment failed; funds released
+
+        else No response within 10 seconds
+            Biller --> PS : TIMEOUT / no response
+            PS -> DB : Save outcome; State -> Unknown
+            PS -> DB : Save status history
+            PS -> Scheduler : scheduleInquiries(paymentId)
+            Scheduler -> DB : Store inquiries at +1, +5, +15 minutes
+            PS --> API : Unknown payment status
+            API --> Customer : Payment pending confirmation\nFunds remain held
+
+            loop Each scheduled inquiry (1, 5, 15 minutes)
+                Scheduler -> PS : Execute status inquiry
+                PS -> Factory : getAdapter(billerCode)
+                Factory --> PS : BillerAdapter
+                PS -> Biller : inquirePaymentStatus(paymentReference)
+
+                alt Status confirmed completed
+                    Biller --> PS : CONFIRMED
+                    PS -> Wallet : captureFunds(paymentId)
+                    Wallet -> DB : Capture held funds once
+                    PS -> DB : State -> Completed + history
+                    PS -> Events : Publish COMPLETED
+                    Events -> Notify : Notify customer
+                    break Definitive outcome received
+                else Status definitively refused
+                    Biller --> PS : REFUSED
+                    PS -> Wallet : releaseFunds(paymentId)
+                    Wallet -> DB : Release held funds once
+                    PS -> DB : State -> Failed + history
+                    PS -> Events : Publish FAILED
+                    Events -> Notify : Notify customer
+                    break Definitive outcome received
+                else Still pending / no answer
+                    Biller --> PS : ACCEPTED_PENDING / TIMEOUT
+                    PS -> DB : Record inquiry attempt
+                    note over PS,Wallet
+                        Keep payment Unknown and funds held.
+                        Never resubmit the payment.
+                    end note
+                end
+            end
+
+            note over PS,DB
+                If all inquiries have no definitive result,
+                payment remains Unknown until reconciliation
+                or a late authoritative biller callback.
+            end note
+        end
+    end
+end
+
+@enduml

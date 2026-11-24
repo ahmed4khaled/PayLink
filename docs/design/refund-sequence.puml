@@ -1,0 +1,86 @@
+@startuml
+title PayLink - Completed Payment Refund Sequence Diagram
+skinparam shadowing false
+autonumber
+
+actor Customer
+actor "Support Employee" as Support
+participant "Refund API" as API
+participant "RefundService" as Refund
+participant "PaymentService" as PaymentService
+participant "WalletService" as Wallet
+participant "AuditService" as Audit
+participant "PaymentEventPublisher" as Events
+participant "NotificationService" as Notify
+database "PayLink Database" as DB
+
+Customer -> API : Request refund(paymentId)
+API -> Refund : submitRequest(paymentId, customerId)
+Refund -> DB : Load payment
+DB --> Refund : Payment
+
+alt Payment is not Completed
+    Refund --> API : Refund not eligible
+    API --> Customer : Request rejected
+else Payment is Completed
+    Refund -> DB : Create RefundRequest(REQUESTED)
+    Refund -> Audit : Record refund request
+    Audit -> DB : Append audit log
+    Refund --> API : Refund request created
+    API --> Customer : Refund pending review
+
+    Support -> API : Review refund request
+    API -> Refund : review(refundRequestId)
+    Refund -> DB : Load request and payment
+    DB --> Refund : Request + payment
+    Refund --> Support : Refund details
+
+    Support -> API : Approve or reject with reason
+    API -> Refund : decide(id, approved, supportId)
+    Refund -> DB : Verify request still REQUESTED\nand payment still Completed
+
+    alt Support rejects
+        Refund -> DB : Set request REJECTED\nstore reviewer, reason, timestamp
+        Refund -> Audit : Record rejection
+        Audit -> DB : Append audit log
+        Refund -> Events : Publish refund decision rejected
+        Events -> Notify : Notify customer
+        Refund --> API : Refund rejected
+        API --> Customer : Refund request rejected
+
+    else Support approves
+        Refund -> DB : Set request APPROVED\nstore reviewer, reason, timestamp
+        Refund -> Audit : Record approval
+        Audit -> DB : Append audit log
+        Refund -> Refund : processApproved(refundRequestId)
+        Refund -> DB : Check refund not already processed
+        DB --> Refund : Not processed
+        Refund -> Wallet : credit(walletId, refundAmount, REFUND)
+        Wallet -> DB : Atomic idempotent REFUND ledger entry
+        DB --> Wallet : Refund credit recorded
+        Wallet --> Refund : Credit successful
+
+        Refund -> PaymentService : Mark payment Refunded
+        PaymentService -> DB : Validate Completed -> Refunded\nappend status history
+        DB --> PaymentService : State updated
+        PaymentService --> Refund : Payment refunded
+
+        Refund -> DB : Set RefundRequest PROCESSED
+        Refund -> Audit : Record refund processing
+        Audit -> DB : Append audit log
+        Refund -> Events : Publish REFUNDED event
+        Events -> Notify : onPaymentEvent(REFUNDED)
+        Notify -> DB : Create and deliver notification
+        Refund --> API : Refund processed
+        API --> Customer : Refund completed
+    end
+end
+
+note over Refund,Wallet
+    A completed-payment refund is separate from
+    releasing a hold for a Failed payment.
+    Processing is idempotent: a request/payment
+    cannot be credited more than once.
+end note
+
+@enduml
