@@ -7,6 +7,8 @@ on:
       - main
       - develop
       - "feature/**"
+    tags:
+      - phase-1
   pull_request:
     branches:
       - main

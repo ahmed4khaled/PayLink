@@ -15,6 +15,9 @@ FROM eclipse-temurin:27-jre-ubi10-minimal
 
 WORKDIR /app
 
+# The Compose health check uses curl to query Spring Boot Actuator.
+RUN microdnf install -y curl-minimal && microdnf clean all
+
 # Copy the generated JAR
 COPY --from=build /app/target/paylink-0.0.1-SNAPSHOT.jar app.jar
 
