@@ -1,0 +1,98 @@
+@startuml
+title PayLink - Failed Payment Hold Release (Required Phase 1 Sequence)
+skinparam shadowing false
+autonumber
+
+actor Customer
+participant "Payment Processing" as Payment
+participant "Biller Adapter" as Biller
+participant "WalletService" as Wallet
+participant "PaymentEventPublisher" as Events
+participant "NotificationService" as Notify
+participant "AuditService" as Audit
+database "PayLink Database" as DB
+
+Biller --> Payment : Definitive refusal + reason
+Payment -> DB : Persist biller outcome
+Payment -> DB : Transition SentToBiller -> Failed\nappend status history
+Payment -> Audit : Record failed outcome
+Audit -> DB : Append audit record
+Payment -> Wallet : releaseHeldFunds(paymentId) [key = paymentId/RELEASE]
+Wallet -> DB : Atomic transaction: append release movement and ledger entries\nFailed -> Refunded + status history
+DB --> Wallet : Release and transition committed once
+Wallet --> Payment : Funds available; payment Refunded
+Payment -> Audit : Record financial release (who, when, why)
+Audit -> DB : Append audit record
+Payment -> Events : Publish failure event asynchronously
+Events ->> Notify : onPaymentEvent(FAILED)
+Notify -> DB : Persist notification; deliver/retry independently
+Notify --> Customer : Failure notification with reason
+
+note over Payment,Wallet
+  This is the mandatory failure workflow. The hold release is
+  atomic and idempotent. Unknown payments retain their hold and
+  cannot enter this flow until definitive failure evidence moves
+  them to Failed.
+  The hold is the full customer total, including the service fee.
+end note
+@enduml
+
+@startuml
+title PayLink - Proposed Optional Completed Payment Refund (FR-27; team/TA decision pending)
+skinparam shadowing false
+autonumber
+
+actor Customer
+actor "Support Employee" as Support
+participant "Refund API" as API
+participant "RefundService" as Refund
+participant "WalletService" as Wallet
+participant "AuditService" as Audit
+database "PayLink Database" as DB
+
+Customer -> API : Request refund(paymentId)
+API -> Refund : submitRequest(paymentId, customerId)
+Refund -> DB : Verify payment exists and is Completed; create request
+DB --> Refund : RefundRequest(REQUESTED)
+Refund -> Audit : Record request
+Audit -> DB : Append audit log
+Refund --> Customer : Request pending review
+
+Support -> API : Authorized Support-role reviewer decides with reason
+API -> Refund : decide(requestId, approved, supportId, reason)
+Refund -> DB : Verify REQUESTED and Completed; store reviewer, decision time and reason
+
+alt Support rejects
+  Refund -> DB : Set request REJECTED with reviewer, time and reason
+  Refund -> Audit : Record outcome, actor, time, reason and payment/refund IDs
+  Audit -> DB : Append audit log
+else Support approves
+  Refund -> DB : Set request APPROVED with reviewer, time and reason
+  Refund -> Audit : Record outcome, actor, time, reason and payment/refund IDs
+  Audit -> DB : Append audit log
+  Refund -> Wallet : Proposed: credit customer wallet once (AQ-07/AQ-12 pending)
+  Wallet -> DB : Proposed atomic wallet credit and REFUND ledger movement
+  DB --> Wallet : Credit recorded once
+  Wallet --> Refund : Credit successful
+  Refund -> DB : Set request PROCESSED
+  Refund -> Audit : Record financial processing and resulting ledger movement ID
+  Audit -> DB : Append audit log
+end
+
+note over Refund,DB
+  PROPOSAL ONLY — this flow does not finalize the unresolved business
+  decision. The wallet-credit method and refund amount/eligibility remain
+  unresolved under AQ-07. The user approved the proposed AQ-12 rule on
+  2026-11-25: one authorized Support-role reviewer; audit actor, time,
+  outcome, reason, payment/refund identifiers and resulting ledger movement;
+  no dual control. Team/TA confirmation is still pending; this is not
+  team/TA approval.
+  On 2026-11-25 the user approved deferring implementation and method
+  selection until team/TA resolution. This is not team/TA approval.
+  FR-27 is optional and distinct from Failed -> Refunded hold release.
+  The official lifecycle makes Completed terminal and lists no
+  Completed -> Refunded transition. This workflow therefore records
+  its own RefundRequest status and does not alter Payment.state.
+  No completed-payment refund method or rule is approved by this diagram.
+end note
+@enduml
