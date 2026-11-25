@@ -20,7 +20,11 @@ actor "Notification Provider\n(SMS / Push / Email)" as NotifProvider
 
 rectangle "PayLink System" {
   usecase "Log In" as UC_Login
-  usecase "Register Account" as UC_Register
+  usecase "Log Out" as UC_Logout
+  usecase "Log Out from All Devices" as UC_LogoutAll
+  usecase "Change Password" as UC_ChangePassword
+  usecase "Reset Password" as UC_ResetPassword
+  usecase "Register Account /\nComplete Account Registration" as UC_Register
   usecase "Upgrade Verification Level" as UC_Upgrade
   usecase "View Wallet Balance" as UC_Balance
   usecase "View Transaction History" as UC_History
@@ -61,6 +65,7 @@ rectangle "PayLink System" {
   usecase "Block or Unblock Account" as UC_Block
 
   usecase "Reconcile Payment Records" as UC_Reconcile
+  usecase "Prepare and Upload NetCo\nDaily Payments CSV (optional)" as UC_UploadNetCo
   usecase "Import Settlement Data" as UC_Import
   usecase "Review Reconciliation Reports" as UC_ReviewReport
 }
@@ -70,6 +75,22 @@ Customer -- UC_Login
 Agent -- UC_Login
 Admin -- UC_Login
 Support -- UC_Login
+Customer -- UC_Logout
+Agent -- UC_Logout
+Admin -- UC_Logout
+Support -- UC_Logout
+Customer -- UC_LogoutAll
+Agent -- UC_LogoutAll
+Admin -- UC_LogoutAll
+Support -- UC_LogoutAll
+Customer -- UC_ChangePassword
+Agent -- UC_ChangePassword
+Admin -- UC_ChangePassword
+Support -- UC_ChangePassword
+Customer -- UC_ResetPassword
+Agent -- UC_ResetPassword
+Admin -- UC_ResetPassword
+Support -- UC_ResetPassword
 
 Customer -- UC_Register
 Customer -- UC_Upgrade
@@ -103,6 +124,7 @@ Support -- UC_ReviewReport
 
 Timer -- UC_Retry
 Timer -- UC_Reconcile
+Timer -- UC_UploadNetCo
 Timer -- UC_NotifyRetry
 
 UC_TopUpCard -- CardProvider
@@ -111,7 +133,7 @@ UC_Submit -- Biller
 UC_StatusInquiry -- Biller
 UC_Callback -- Biller
 UC_Import -- Biller
-UC_Submit -- NetCo
+UC_UploadNetCo -- NetCo
 UC_Import -- NetCo
 UC_Deliver -- NotifProvider
 
@@ -127,7 +149,7 @@ UC_ViewFees ..> UC_Fee : <<include>>
 UC_Capture ..> UC_Pay : <<extend>>\n[payment Completed,\nimmediately or later]
 UC_Release ..> UC_Pay : <<extend>>\n[payment Failed,\nimmediately or later]
 UC_Commission ..> UC_Pay : <<extend>>\n[agent-assisted, Completed]
-UC_Notify ..> UC_Pay : <<extend>>\n[Completed, Failed,\nRejected or Refunded]
+UC_Notify ..> UC_Pay : <<extend>>\n[Completed or Failed required;\nRejected / Refunded optional proposal]
 
 UC_Callback ..> UC_Submit : <<extend>>\n[async biller]
 UC_Retry ..> UC_StatusInquiry : <<include>>
@@ -144,6 +166,8 @@ UC_Reconcile ..> UC_Import : <<include>>
 note as N1
   <b>Pay Bill:</b> validates the service amount range
   and the idempotency key.
+  The customer sees bill amount, fee, and total before confirming;
+  the full total is held.
   Fraud checks enforce the single-payment limit
   (5 - 10,000 EGP), daily limits and velocity rules.
   No answer from a live biller in 10 seconds:
@@ -154,6 +178,11 @@ end note
 note as N2
   <b>Retry Unknown Payment:</b> re-queries the biller
   after 1, 5 and 15 minutes.
+  The brief does not specify the offsets' anchor; the
+  user-approved AQ-15 interpretation (2026-11-25) measures all offsets
+  from entry into Unknown. Rationale: deterministic retry times from
+  the start of the unresolved state. This records user approval,
+  not team/TA approval.
   It never re-sends the payment.
   If all attempts fail to obtain a definitive result,
   payment stays Unknown and funds stay held
@@ -165,6 +194,8 @@ note as N3
   result-file evidence can resolve Unknown payments
   to Completed or Failed.
   Differences are flagged in the report.
+  If settlement lists a PayLink Failed payment, flag the mismatch
+  for Support review; do not change payment state automatically.
   Late confirmation (callback, retry, settlement)
   triggers capture or release, commission
   and notification as applicable.
@@ -187,16 +218,44 @@ end note
 note as N6
   Releasing a failed payment hold is not the same
   as refunding a previously completed payment.
+  A definitive failure follows Failed -> Refunded when
+  its held funds are released exactly once. FR-27 remains
+  optional. The user approved deferring implementation and method,
+  amount/eligibility and ledger definition until team/TA resolves
+  AQ-07/AQ-12 (2026-11-25); this is not team/TA approval.
+  No Completed -> Refunded transition or refund method is approved.
   The completed-payment refund requires a request,
-  support review and approval.
+  support review and approval. User-approved AQ-12 proposal, pending
+  team/TA confirmation: one authorized Support-role reviewer; audit
+  actor, timestamp, outcome, reason, payment/refund identifiers and
+  resulting ledger movement; no dual control proposed.
 end note
 
 note as N7
   Payment notifications are triggered by payment
   lifecycle events, including late outcomes received
   through callbacks, retries or reconciliation.
+  FR-22 requires Completed and Failed outcomes.
+  Rejected and separate refund notifications are optional
+  proposals and require team approval.
   Notification delivery is independent of payment
   processing.
+end note
+
+note as N9
+  The brief defines more than 5 payments in 60 seconds
+  as the velocity threshold. User-approved AQ-14 interpretation
+  (2026-11-25): count payment initiation attempts, including
+  attempts later rejected. Rationale: prevent rapid activity evading
+  the rule through rejected outcomes. This records user approval only.
+  Daily-limit fee/rejected-attempt counting remains open.
+end note
+
+note as N8
+  Optional NetCo integration is batch-only: Scheduler uploads one
+  Payments CSV per day; NetCo returns a Result File the next morning.
+  NetCo has no live inquiry use case. Result-file evidence is imported
+  for reconciliation and may resolve matching Unknown payments.
 end note
 
 @enduml

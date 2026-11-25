@@ -40,7 +40,7 @@ Every payment is in exactly one official state. The system must permit only the 
 
 - `Completed`, `Rejected` and `Refunded` are final states.
 - A payment in `Unknown` keeps its funds held. It must never be refunded automatically; funds are returned only after the system has definitive evidence that the biller did not receive the payment.
-- Unknown-payment retry attempts are scheduled 1 minute, 5 minutes and 15 minutes after the payment first enters `Unknown` (three retry attempts in total). If all retries finish without a confirmed result, no state transition occurs: the payment remains `Unknown` and waits for reconciliation.
+- **User-approved AQ-15 decision (2026-11-25):** measure the 1, 5 and 15 minute Unknown-payment status inquiry offsets from the time the payment first enters `Unknown` (three retry attempts in total). **Reason:** this produces deterministic retry times from the start of the unresolved state. The Student Brief specifies the offsets but not their anchor. This records user approval, not team/TA approval. If all retries finish without a confirmed result, no state transition occurs: the payment remains `Unknown` and waits for reconciliation.
 - A confirmed failure releases the hold exactly once and changes `Failed` to `Refunded`. `Rejected` occurs before funds are held and therefore does not require a hold release.
 
 **State diagram:**
@@ -140,9 +140,9 @@ The following stakeholders are supported by the brief.
 | Internet fee              | 2 EGP up to 200 EGP; 4 EGP above 200 EGP                  |
 | Promotion                 | Zero fee for one configured biller during configured dates |
 | Agent commission          | 40% of service fee                                        |
-| Velocity                  | More than 5 payment attempts in 60 seconds; block new payment attempts for 10 minutes |
+| Velocity                  | More than 5 payment initiation attempts, including attempts later rejected, in 60 seconds; block new payment attempts for 10 minutes (user-approved AQ-14 interpretation, 2026-11-25) |
 | Live biller timeout       | 10 seconds                                                |
-| Unknown retries           | After 1, 5 and 15 minutes; maximum 3 retries              |
+| Unknown retries           | At 1, 5 and 15 minutes after entry into `Unknown`; maximum 3 retries (user-approved AQ-15 interpretation, 2026-11-25) |
 | Notification retries      | Failed SMS or email: 3 retries, then undelivered; push retry scope requires clarification |
 | Money calculations        | Exact decimal types, never floating point                 |
 
@@ -442,7 +442,7 @@ The following stakeholders are supported by the brief.
 
 **Acceptance Criteria:**
 
-1. **Given** a payment is `Initiated`, **When** fraud checks pass and the available wallet balance is sufficient, **Then** the system shall move the amount required to cover the payment into held balance and the payment shall become `FundsHeld`. The exact treatment of the service fee within the held amount is an open point (AQ-13).
+1. **Given** a payment is `Initiated`, **When** fraud checks pass and the available wallet balance is sufficient, **Then** the system shall move the full customer total (bill amount plus service fee) into held balance and the payment shall become `FundsHeld`. Section 2.2 confirms this with Sara's 350.00 EGP bill plus 2.50 EGP fee, holding 352.50 EGP; AQ-13 is resolved by the Student Brief.
 2. **Given** a payment is `Initiated`, **When** the wallet does not have sufficient available funds, **Then** the payment becomes `Rejected` and no hold is created.
 3. **Given** funds are held for a payment, **When** another transaction attempts to spend those funds, **Then** the held amount is unavailable for that transaction.
 4. **Given** a payment is `FundsHeld` or `SentToBiller`, **When** the biller outcome is not yet confirmed, **Then** the held funds shall remain reserved.
@@ -461,9 +461,9 @@ The following stakeholders are supported by the brief.
 **Acceptance Criteria:**
 
 1. **Given** a payment is `SentToBiller`, **When** no live-biller response arrives within 10 seconds, **Then** the payment changes to `Unknown` and its funds remain held.
-2. **Given** a payment has entered `Unknown`, **When** its first retry becomes due, **Then** the system shall query the biller for the first retry one minute after the payment enters `Unknown`.
-3. **Given** a payment remains `Unknown` after the first retry, **When** its second retry becomes due, **Then** the system shall query the biller for the second retry five minutes after the payment enters `Unknown`.
-4. **Given** a payment remains `Unknown` after the second retry, **When** its third retry becomes due, **Then** the system shall query the biller for the third retry fifteen minutes after the payment enters `Unknown`.
+2. **User-approved AQ-15 interpretation (2026-11-25):** **Given** a payment has entered `Unknown`, **When** its first retry becomes due, **Then** the system shall query the biller one minute after entry into `Unknown`.
+3. **User-approved AQ-15 interpretation (2026-11-25):** **Given** a payment remains `Unknown` after the first retry, **When** its second retry becomes due, **Then** the system shall query the biller five minutes after entry into `Unknown`.
+4. **User-approved AQ-15 interpretation (2026-11-25):** **Given** a payment remains `Unknown` after the second retry, **When** its third retry becomes due, **Then** the system shall query the biller fifteen minutes after entry into `Unknown`.
 5. **Given** a payment is `Unknown`, **When** retry processing is scheduled, **Then** no more than three retry attempts shall be performed, at the scheduled offsets above.
 6. **Given** a payment is `Unknown`, **When** a retry or callback confirms successful payment, **Then** the payment shall change to `Completed`.
 7. **Given** a payment is `Unknown`, **When** the biller refuses or a retry confirms that payment failed, **Then** the payment shall change to `Failed` and the hold may be released through the `Failed` to `Refunded` transition.
@@ -546,7 +546,7 @@ The following stakeholders are supported by the brief.
 
 > As a payment system, I want to enforce daily payment limits and velocity rules, so that suspicious or excessive payment activity is blocked.
 
-**Working interpretation requiring team/TA confirmation:** The velocity rule counts payment initiation attempts (including attempts later rejected) within a rolling 60-second window. The 10-minute velocity block prevents new payment initiation; it does not cancel payments already in progress. Whether daily limits include service fees, and whether rejected attempts count toward daily limits, remain open points (AQ-14).
+**User-approved AQ-14 decision (2026-11-25):** Count payment initiation attempts, including attempts later rejected, within a rolling 60-second window. **Reason:** this detects rapid repeated activity before it can evade the velocity rule through rejected outcomes. The 10-minute velocity block prevents new payment initiation; it does not cancel payments already in progress. Whether daily limits include service fees or rejected attempts remains open under AQ-14. This records the user's approval; it does not claim approval by the whole team or TA.
 
 **Acceptance Criteria:**
 
@@ -560,6 +560,7 @@ The following stakeholders are supported by the brief.
 8. **Given** a customer is attempting to initiate a payment, **When** the customer submits a payment request, **Then** the system shall block the customer's payment activity for 10 minutes after exceeding the velocity threshold.
 9. **Given** a customer is attempting to initiate a payment, **When** the customer submits a payment request, **Then** the system shall prevent blocked customers from initiating new payments during the blocking period.
 10. **Given** a customer is attempting to initiate a payment, **When** the customer submits a payment request, **Then** the system shall restore payment access after the 10-minute blocking period expires.
+11. **Given** a distinct payment initiation attempt is evaluated by the velocity rule, **When** that attempt is later rejected, **Then** it shall still count toward the rolling 60-second velocity threshold.
 
 ### US-021 – Support Payment Search
 
@@ -688,7 +689,7 @@ This is the failed-payment funds-release scenario required by the Student Brief 
 11. **Given** a customer is requesting a refund for a completed payment, **When** an authorized support employee approves or rejects the refund request, **Then** the system shall prevent the same payment from being refunded more than once.
 12. **Given** a customer is requesting a refund for a completed payment, **When** an authorized support employee approves or rejects the refund request, **Then** the system shall maintain the refund request status for tracking and investigation.
 
-> **Open point:** The exact refund processing method, approval authorization and ledger treatment are not defined in the project brief (AQ-07 and AQ-12).
+> **User-approved deferral (2026-11-25):** FR-27 remains optional and outside the Phase 1 implementation baseline. Defer choosing the refund method, amount/eligibility and ledger treatment until the team/TA resolves AQ-07 and AQ-12. The user separately approved the proposed AQ-12 reviewer/audit rule below, but team/TA confirmation is pending. This is not team/TA approval. The workflow details remain open.
 
 ---
 
@@ -716,26 +717,28 @@ The Student Brief is authoritative. The decisions below distinguish requirements
 | AQ-01 | What information is required during customer registration? | The brief requires customer registration with Basic verification but does not enumerate the required personal fields. Do not add fields until the team/TA confirms them. | **Open – ask TA** |
 | AQ-02 | How is Basic-to-Verified upgrade approved? | Verified status and the 30,000 EGP daily limit apply only after successful verification approval. The approval actor, evidence and workflow are unspecified. | **Open – ask TA** |
 | AQ-03 | What are the simulated card top-up rules? | Simulated card top-up is supported; the brief does not define provider behaviour, limits or failure simulation rules. Agent cash top-up is also required. | **Open – ask TA** |
-| AQ-04 | How is an agent identified and authenticated? | Agent-assisted payments and agent commission are required. Authentication mechanism and credential lifecycle are unspecified. | **Open – ask TA** |
+| AQ-04 | How are agent accounts identified, provisioned and given credentials, and what login identifier is used? | Internal authentication in PayLink is approved. On 2026-11-25, the user approved leaving the login identifier unspecified until account provisioning for Customer, Agent, Admin, and Support is defined. **Reason:** the Student Brief selects no credential key, and choosing one now would invent a requirement. This records user approval, not team/TA approval. Agent identity provisioning and credential lifecycle remain open; no phone, email, username, or other key is selected. | **Partly resolved - internal authentication approved; user-approved deferral of identifier selection; provisioning and credential lifecycle remain open** |
 | AQ-05 | What happens when a bill inquiry fails or times out? | Display an appropriate error when the biller rejects or returns an unsuccessful response. Timeout/retry behaviour for inquiries is not specified; do not initiate payment automatically. | **Partly decided; timeout policy open** |
 | AQ-06 | What happens if the bill amount changes between inquiry and payment? | The customer must review the amount, fee and total before payment. The exact stale-inquiry/changed-amount handling is not specified. | **Open – ask TA** |
-| AQ-07 | How are completed payment refunds processed and recorded? | US-027 / FR-27 is **Could** and retained. It is distinct from the mandatory Failed → Refunded hold-release lifecycle. The completed-payment refund workflow is not defined. | **Open – ask TA** |
+| AQ-07 | How are completed payment refunds processed and recorded? | **User-approved deferral (2026-11-25):** keep US-027 / FR-27 **Could** and outside the Phase 1 implementation baseline. Do not select the refund method, amount/eligibility or ledger treatment until the team/TA resolves AQ-07 and AQ-12. This is user approval, not team/TA approval. It is distinct from the mandatory Failed → Refunded hold-release lifecycle. | **User-approved deferral; workflow details remain open pending team/TA resolution** |
 | AQ-08 | What happens when a biller does not respond after all three retries? | The payment remains `Unknown`, funds remain held, and reconciliation is awaited. No automatic Failed or Refunded transition is allowed without definitive evidence. | **Decided by brief** |
 | AQ-09 | How are callback requests authenticated? | TopUpNet asynchronous callbacks must be accepted and duplicates ignored/logged. The authentication/signature mechanism is unspecified. | **Open – ask TA** |
 | AQ-10 | What happens when an account is blocked during an existing payment? | A blocked account cannot initiate new payments. The brief does not specify whether already initiated/in-flight payments are cancelled or allowed to complete. | **Open – ask TA** |
 | AQ-11 | Which timezone defines daily limits and reconciliation? | Daily limits and daily reconciliation are required, but the timezone is not specified. Do not assume UTC or Egypt local time without agreement. | **Open – ask TA** |
-| AQ-12 | How are support refund approvals authorized and audited? | FR-27 requires Support approval for a completed-payment refund; FR-25 requires admin actions and money movements to be audited. The approval roles, dual control and audit detail for this workflow are unspecified. | **Open – ask TA** |
-| AQ-13 | Does the payment hold include the bill amount only or the bill amount plus service fee? | The customer must see the fee and total before confirmation, but the exact composition of the held amount needs confirmation. | **Open – ask TA** |
-| AQ-14 | How are daily limits calculated? | The brief defines Basic and Verified daily limits. Whether the daily total includes service fees and how rejected attempts are counted need confirmation. | **Open – ask TA** |
-| AQ-15 | Are retry offsets measured from entry into `Unknown` or from the previous retry? | This document uses 1, 5 and 15 minutes from entry into `Unknown` as a working schedule interpretation. Confirm the intended timing with the team/TA before implementation. | **Open – ask TA** |
+| AQ-12 | How are support refund approvals authorized and audited? | **User-approved proposal (2026-11-25; team/TA confirmation pending):** one authorized Support-role user may approve or reject the request; record actor, timestamp, outcome, reason, payment/refund identifiers and any resulting ledger movement; no dual-control approval is required by this proposed workflow. **Reason:** this follows the brief's Support-approval requirement and makes the financial action auditable without adding an unspecified second approver. This records user approval only, not team/TA approval. | **User-approved proposal; team/TA confirmation pending** |
+| AQ-13 | Does the payment hold include the bill amount only or the bill amount plus service fee? | Section 2.2 says Sara's 350.00 EGP bill plus 2.50 EGP fee is held as 352.50 EGP. Hold the full customer total. | **Resolved by Student Brief 2.2** |
+| AQ-14 | How are daily limits calculated, and how are velocity attempts counted? | **User-approved velocity interpretation (2026-11-25):** count payment initiation attempts, including those later rejected. Still open: whether daily totals include service fees or rejected attempts. | **Partly resolved – velocity interpretation user-approved; daily-limit calculation open** |
+| AQ-15 | Are retry offsets measured from entry into `Unknown` or from the previous retry? | **User-approved decision (2026-11-25):** measure all three offsets (1, 5 and 15 minutes) from entry into `Unknown`. **Reason:** this gives deterministic retry times from the start of the unresolved payment state. The Student Brief does not specify the anchor. This records user approval, not team/TA approval. | **Resolved by user approval; team/TA acknowledgement if required** |
 | AQ-16 | Do push notifications receive the same three retries as SMS/email? | FR-22 requires SMS and push notifications on completion/failure. Section 2.6 specifically states that failed SMS or email is retried three times. Apply the explicit retry rule to SMS/email; confirm separately whether push must use the same retry policy. | **Open – ask TA** |
 
 ### Confirmed scope and lifecycle decisions
 
 - **Payment states:** use only `Initiated`, `FundsHeld`, `SentToBiller`, `Completed`, `Rejected`, `Failed`, `Unknown` and `Refunded`.
-- **Unknown after retries:** after retries at 1, 5 and 15 minutes, keep the payment `Unknown`, keep funds held and wait for reconciliation.
+- **Hold composition (AQ-13):** hold the full customer total (bill amount plus fee), per the Sara example in Section 2.2.
+- **Unknown after retries:** after retries at 1, 5 and 15 minutes from entry into `Unknown` (user-approved AQ-15 interpretation, 2026-11-25), keep the payment `Unknown`, keep funds held and wait for reconciliation.
 - **Refund distinction:** failed-payment hold release is the mandatory lifecycle path (`Failed` → release hold → `Refunded`). US-027/FR-27 is a separate optional request to refund a `Completed` payment.
+- **Completed-payment refund deferral (AQ-07):** the user approved keeping FR-27 optional and outside the Phase 1 implementation baseline on 2026-11-25. Refund method, amount/eligibility and ledger treatment remain open until team/TA resolution; this is not team/TA approval.
+- **Refund approval/audit proposal (AQ-12):** the user approved one authorized Support-role reviewer, with actor, timestamp, outcome, reason, payment/refund identifiers and resulting ledger movement recorded, and no dual control in the proposed flow (2026-11-25). Team/TA confirmation remains pending; this is not team/TA approval.
 - **Biller scope:** Phase 2 requires ElectroCo, AquaCo and TopUpNet as the three mock billers. NetCo's daily CSV integration is optional under FR-15 and is excluded from the mandatory implementation baseline unless agreed otherwise.
 - **NFR-07 to NFR-09:** measurable targets have been proposed in Section 4; they are team proposals, not confirmed brief requirements, and must be agreed with the team/TA before being treated as baselined acceptance commitments.
 - **Notification retries:** the explicit three-retry business rule applies to failed SMS or email. Whether push notifications share that retry policy remains open (AQ-16).
-

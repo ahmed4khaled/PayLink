@@ -1,5 +1,44 @@
 @startuml
-title PayLink - Completed Payment Refund Sequence Diagram
+title PayLink - Failed Payment Hold Release (Required Phase 1 Sequence)
+skinparam shadowing false
+autonumber
+
+actor Customer
+participant "Payment Processing" as Payment
+participant "Biller Adapter" as Biller
+participant "WalletService" as Wallet
+participant "PaymentEventPublisher" as Events
+participant "NotificationService" as Notify
+participant "AuditService" as Audit
+database "PayLink Database" as DB
+
+Biller --> Payment : Definitive refusal + reason
+Payment -> DB : Persist biller outcome
+Payment -> DB : Transition SentToBiller -> Failed\nappend status history
+Payment -> Audit : Record failed outcome
+Audit -> DB : Append audit record
+Payment -> Wallet : releaseHeldFunds(paymentId) [key = paymentId/RELEASE]
+Wallet -> DB : Atomic transaction: append release movement and ledger entries\nFailed -> Refunded + status history
+DB --> Wallet : Release and transition committed once
+Wallet --> Payment : Funds available; payment Refunded
+Payment -> Audit : Record financial release (who, when, why)
+Audit -> DB : Append audit record
+Payment -> Events : Publish failure event asynchronously
+Events ->> Notify : onPaymentEvent(FAILED)
+Notify -> DB : Persist notification; deliver/retry independently
+Notify --> Customer : Failure notification with reason
+
+note over Payment,Wallet
+  This is the mandatory failure workflow. The hold release is
+  atomic and idempotent. Unknown payments retain their hold and
+  cannot enter this flow until definitive failure evidence moves
+  them to Failed.
+  The hold is the full customer total, including the service fee.
+end note
+@enduml
+
+@startuml
+title PayLink - Proposed Optional Completed Payment Refund (FR-27; team/TA decision pending)
 skinparam shadowing false
 autonumber
 
@@ -7,80 +46,53 @@ actor Customer
 actor "Support Employee" as Support
 participant "Refund API" as API
 participant "RefundService" as Refund
-participant "PaymentService" as PaymentService
 participant "WalletService" as Wallet
 participant "AuditService" as Audit
-participant "PaymentEventPublisher" as Events
-participant "NotificationService" as Notify
 database "PayLink Database" as DB
 
 Customer -> API : Request refund(paymentId)
 API -> Refund : submitRequest(paymentId, customerId)
-Refund -> DB : Load payment
-DB --> Refund : Payment
+Refund -> DB : Verify payment exists and is Completed; create request
+DB --> Refund : RefundRequest(REQUESTED)
+Refund -> Audit : Record request
+Audit -> DB : Append audit log
+Refund --> Customer : Request pending review
 
-alt Payment is not Completed
-    Refund --> API : Refund not eligible
-    API --> Customer : Request rejected
-else Payment is Completed
-    Refund -> DB : Create RefundRequest(REQUESTED)
-    Refund -> Audit : Record refund request
-    Audit -> DB : Append audit log
-    Refund --> API : Refund request created
-    API --> Customer : Refund pending review
+Support -> API : Authorized Support-role reviewer decides with reason
+API -> Refund : decide(requestId, approved, supportId, reason)
+Refund -> DB : Verify REQUESTED and Completed; store reviewer, decision time and reason
 
-    Support -> API : Review refund request
-    API -> Refund : review(refundRequestId)
-    Refund -> DB : Load request and payment
-    DB --> Refund : Request + payment
-    Refund --> Support : Refund details
-
-    Support -> API : Approve or reject with reason
-    API -> Refund : decide(id, approved, supportId)
-    Refund -> DB : Verify request still REQUESTED\nand payment still Completed
-
-    alt Support rejects
-        Refund -> DB : Set request REJECTED\nstore reviewer, reason, timestamp
-        Refund -> Audit : Record rejection
-        Audit -> DB : Append audit log
-        Refund -> Events : Publish refund decision rejected
-        Events -> Notify : Notify customer
-        Refund --> API : Refund rejected
-        API --> Customer : Refund request rejected
-
-    else Support approves
-        Refund -> DB : Set request APPROVED\nstore reviewer, reason, timestamp
-        Refund -> Audit : Record approval
-        Audit -> DB : Append audit log
-        Refund -> Refund : processApproved(refundRequestId)
-        Refund -> DB : Check refund not already processed
-        DB --> Refund : Not processed
-        Refund -> Wallet : credit(walletId, refundAmount, REFUND)
-        Wallet -> DB : Atomic idempotent REFUND ledger entry
-        DB --> Wallet : Refund credit recorded
-        Wallet --> Refund : Credit successful
-
-        Refund -> PaymentService : Mark payment Refunded
-        PaymentService -> DB : Validate Completed -> Refunded\nappend status history
-        DB --> PaymentService : State updated
-        PaymentService --> Refund : Payment refunded
-
-        Refund -> DB : Set RefundRequest PROCESSED
-        Refund -> Audit : Record refund processing
-        Audit -> DB : Append audit log
-        Refund -> Events : Publish REFUNDED event
-        Events -> Notify : onPaymentEvent(REFUNDED)
-        Notify -> DB : Create and deliver notification
-        Refund --> API : Refund processed
-        API --> Customer : Refund completed
-    end
+alt Support rejects
+  Refund -> DB : Set request REJECTED with reviewer, time and reason
+  Refund -> Audit : Record outcome, actor, time, reason and payment/refund IDs
+  Audit -> DB : Append audit log
+else Support approves
+  Refund -> DB : Set request APPROVED with reviewer, time and reason
+  Refund -> Audit : Record outcome, actor, time, reason and payment/refund IDs
+  Audit -> DB : Append audit log
+  Refund -> Wallet : Proposed: credit customer wallet once (AQ-07/AQ-12 pending)
+  Wallet -> DB : Proposed atomic wallet credit and REFUND ledger movement
+  DB --> Wallet : Credit recorded once
+  Wallet --> Refund : Credit successful
+  Refund -> DB : Set request PROCESSED
+  Refund -> Audit : Record financial processing and resulting ledger movement ID
+  Audit -> DB : Append audit log
 end
 
-note over Refund,Wallet
-    A completed-payment refund is separate from
-    releasing a hold for a Failed payment.
-    Processing is idempotent: a request/payment
-    cannot be credited more than once.
+note over Refund,DB
+  PROPOSAL ONLY — this flow does not finalize the unresolved business
+  decision. The wallet-credit method and refund amount/eligibility remain
+  unresolved under AQ-07. The user approved the proposed AQ-12 rule on
+  2026-11-25: one authorized Support-role reviewer; audit actor, time,
+  outcome, reason, payment/refund identifiers and resulting ledger movement;
+  no dual control. Team/TA confirmation is still pending; this is not
+  team/TA approval.
+  On 2026-11-25 the user approved deferring implementation and method
+  selection until team/TA resolution. This is not team/TA approval.
+  FR-27 is optional and distinct from Failed -> Refunded hold release.
+  The official lifecycle makes Completed terminal and lists no
+  Completed -> Refunded transition. This workflow therefore records
+  its own RefundRequest status and does not alter Payment.state.
+  No completed-payment refund method or rule is approved by this diagram.
 end note
-
 @enduml

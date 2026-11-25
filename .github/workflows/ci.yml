@@ -4,9 +4,7 @@ name: PayLink CI
 on:
   push:
     branches:
-      - main
-      - develop
-      - "feature/**"
+      - "**"
     tags:
       - phase-1
   pull_request:

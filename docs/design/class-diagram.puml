@@ -48,6 +48,11 @@ package "Accounts and Wallet" {
     HELD
   }
 
+  enum HoldResult {
+    HELD
+    INSUFFICIENT_AVAILABLE
+  }
+
   enum TopUpMethod {
     CARD
     AGENT_CASH
@@ -93,6 +98,16 @@ package "Accounts and Wallet" {
     +reason : String
   }
 
+  class FinancialMovement <<entity>> {
+    +movementId : UUID
+    +idempotencyKey : String
+    +type : LedgerEntryType
+    +paymentId : UUID?
+    +refundPaymentId : UUID?
+    +topUpId : UUID?
+    +createdAt : DateTime
+  }
+
   class TopUp <<entity>> {
     +topUpId : UUID
     +walletId : UUID
@@ -100,6 +115,7 @@ package "Accounts and Wallet" {
     +amount : Money
     +agentAccountId : UUID?
     +status : TopUpStatus
+    +gatewayReference : String?
     +createdAt : DateTime
   }
 
@@ -129,13 +145,141 @@ package "Accounts and Wallet" {
   class WalletService <<service>> {
     +topUpByCard(walletId : UUID, amount : Money, cardToken : String) : TopUp
     +topUpByAgent(agentId : UUID, walletId : UUID, amount : Money) : TopUp
-    +holdFunds(walletId : UUID, paymentId : UUID, amount : Money) : void
+    +holdFunds(walletId : UUID, paymentId : UUID, totalAmount : Money) : HoldResult
     +captureFunds(paymentId : UUID) : void
     +releaseFunds(paymentId : UUID) : void
     +credit(walletId : UUID, amount : Money, type : LedgerEntryType, reason : String) : LedgerEntry
     +getTransactions(walletId : UUID) : List<LedgerEntry>
   }
 }
+
+' ---------- Authentication ----------
+package "Authentication" {
+  class AuthenticationRequest <<value>> {
+    +loginIdentifier : String
+    +password : Secret
+  }
+
+  class AuthenticatedPrincipal <<value>> {
+    +accountId : UUID
+    +authorities : Set<AccountRole>
+  }
+
+  class AccountCredentials <<entity>> {
+    +credentialId : UUID
+    +accountId : UUID
+    +passwordHash : Argon2idHash
+    +failedLoginAttempts : Integer
+    +lockedUntil : DateTime?
+    +passwordUpdatedAt : DateTime
+    +createdAt : DateTime
+    +updatedAt : DateTime
+  }
+
+  class LoginSession <<entity>> {
+    +sessionId : UUID
+    +accountId : UUID
+    +tokenHash : String
+    +createdAt : DateTime
+    +expiresAt : DateTime
+    +lastActivityAt : DateTime
+    +revokedAt : DateTime?
+    +ipAddress : String?
+    +userAgent : String?
+  }
+
+  class SessionSummary <<value>> {
+    +sessionId : UUID
+    +createdAt : DateTime
+    +expiresAt : DateTime
+    +lastActivityAt : DateTime
+    +ipAddress : String?
+    +userAgent : String?
+  }
+
+  interface AuthenticationService {
+    +authenticate(request : AuthenticationRequest) : AuthenticatedPrincipal
+    +validateSession(rawToken : Secret) : AuthenticatedPrincipal
+    +changePassword(accountId : UUID, currentPassword : Secret, newPassword : Secret) : void
+    +initiatePasswordReset(identifier : String) : void
+    +logout(sessionId : UUID) : void
+    +logoutAll(accountId : UUID) : void
+    +recordFailedLogin(accountId : UUID) : void
+  }
+
+  class SessionManager <<service>> {
+    +createSession(accountId : UUID) : Secret
+    +validateSession(rawToken : Secret) : AuthenticatedPrincipal?
+    +activeSessions(accountId : UUID) : List<SessionSummary>
+    +revokeSession(sessionId : UUID) : void
+    +revokeAllActive(accountId : UUID) : void
+  }
+
+  interface AccountRepository <<repository>> {
+    +findForAuthentication(identifier : String) : Account?
+    +findById(accountId : UUID) : Account?
+  }
+
+  interface AccountCredentialsRepository <<repository>> {
+    +findByAccountId(accountId : UUID) : AccountCredentials?
+    +save(credentials : AccountCredentials) : void
+  }
+
+  interface LoginSessionRepository <<repository>> {
+    +save(session : LoginSession) : void
+    +findActiveByTokenHash(tokenHash : String) : LoginSession?
+    +findActiveByAccountId(accountId : UUID) : List<LoginSession>
+    +revoke(sessionId : UUID, at : DateTime) : void
+    +revokeAllActive(accountId : UUID, at : DateTime) : void
+  }
+
+  interface "PasswordEncoder\n(org.springframework.security.crypto.password.PasswordEncoder)" as PasswordEncoder <<Spring Security>>
+  class "Argon2PasswordEncoder\n(org.springframework.security.crypto.argon2.Argon2PasswordEncoder)" as Argon2PasswordEncoder <<Spring Security>>
+  class AuthenticationFilter <<Spring Security>>
+  class SecurityContext <<Spring Security>>
+
+  AuthenticationService ..> PasswordEncoder : injected
+  Argon2PasswordEncoder ..|> PasswordEncoder
+  AuthenticationService ..> AccountRepository
+  AuthenticationService ..> AccountCredentialsRepository
+  AuthenticationService ..> SessionManager
+  SessionManager ..> LoginSessionRepository
+  AuthenticationFilter ..> SessionManager : extracts cookie token / validates
+  AuthenticationFilter ..> SecurityContext : establishes identity and authorities
+  AccountRepository ..> Account
+  AccountCredentialsRepository ..> AccountCredentials
+  LoginSessionRepository ..> LoginSession
+  SessionManager ..> SessionSummary : returns without token hash
+  Account "1" -- "0..1" AccountCredentials
+  Account "1" -- "0..*" LoginSession
+}
+
+note right of AuthenticationService
+  Authentication is implemented internally in PayLink; no external
+  provider or JWT-only stateless session design is used. The existing
+  Spring Security PasswordEncoder interface is injected through DI;
+  Argon2PasswordEncoder is its configured implementation. No custom
+  PasswordHasher or manual hashing implementation is introduced.
+  loginIdentifier is a generic placeholder. The user approved deferring
+  selection until account provisioning for all roles is defined (AQ-04,
+  2026-11-25). This is not team/TA approval; do not assume phone, email,
+  username, or another key. Rationale: the brief selects no credential key.
+  Password reset policy also needs clarification.
+end note
+
+note right of SessionManager
+  Generate cryptographically secure random session tokens. Return the
+  raw value only to the authentication response/cookie path; persist
+  only its secure hash. Reject unknown, expired, or revoked sessions.
+  Active means not expired and not revoked. Revoke one or all sessions.
+end note
+
+note right of AuthenticationFilter
+  Read the token from a Secure, HttpOnly cookie with an appropriate
+  SameSite setting. Apply CSRF protection to cookie-authenticated state
+  changes. Establish account identity and database-derived authorities
+  in SecurityContext; never trust client-supplied roles.
+end note
 
 ' ---------- Biller Catalog ----------
 package "Biller Catalog" {
@@ -172,6 +316,8 @@ package "Biller Catalog" {
   }
 
   class ServiceInputField <<entity>> {
+    +fieldId : UUID
+    +serviceId : UUID
     +fieldName : String
     +label : String
     +dataType : String
@@ -234,6 +380,7 @@ package "Payment Processing" {
     +billAmount : Money
     +serviceFee : Money
     +totalAmount : Money
+    +state : PaymentState
     +reason : String?
     +createdAt : DateTime
     +updatedAt : DateTime
@@ -243,7 +390,7 @@ package "Payment Processing" {
     +confirm(billerReference : String) : void
     +refuse(reason : String) : void
     +markUnknown() : void
-    +release() : void
+    +markRefundedAfterRelease() : void
   }
 
   abstract class PaymentState {
@@ -296,6 +443,7 @@ package "Payment Processing" {
     +decisionReason : String?
     +createdAt : DateTime
     +decidedAt : DateTime?
+    +processedAt : DateTime?
   }
 
   class PaymentEvent <<value>> {
@@ -341,7 +489,7 @@ package "Payment Processing" {
   class RefundService <<application service>> {
     +submitRequest(paymentId : UUID, requestedBy : UUID) : RefundRequest
     +review(refundRequestId : UUID) : RefundRequest
-    +decide(refundRequestId : UUID, approved : Boolean, decidedBy : UUID) : RefundRequest
+    +decide(refundRequestId : UUID, approved : Boolean, decidedBy : UUID, reason : String) : RefundRequest
     +processApproved(refundRequestId : UUID) : void
   }
 }
@@ -410,6 +558,7 @@ package "Biller Integration" {
     +callbackId : UUID
     +billerCode : String
     +paymentReference : String
+    +callbackFingerprint : String
     +payload : String
     +outcome : CallbackOutcome
     +receivedAt : DateTime
@@ -436,6 +585,7 @@ package "Fees and Commissions" {
     +fixedAmount : Money?
     +percentageRate : Decimal?
     +minimumFee : Money?
+    +active : Boolean
   }
 
   class Promotion <<entity>> {
@@ -444,6 +594,7 @@ package "Fees and Commissions" {
     +startDate : Date
     +endDate : Date
     +active : Boolean
+    +feeWaived : Boolean
     +isActiveOn(date : Date) : Boolean
   }
 
@@ -666,7 +817,11 @@ package "Audit and Configuration" {
 ' ---------- Accounts and Wallet relations ----------
 Account "1" -- "1" Wallet : owns
 Account "1" -- "0..*" AccountBlock
+Account "0..1" -- "0..*" AccountBlock : blockedBy
 Wallet "1" *-- "0..*" LedgerEntry
+FinancialMovement "1" *-- "1..*" LedgerEntry : atomic ledger postings
+FinancialMovement ..> Payment : optional payment source
+FinancialMovement ..> TopUp : optional top-up source
 Wallet "1" -- "0..*" TopUp
 TopUp ..> CardPaymentGateway
 SimulatedCardGateway ..|> CardPaymentGateway
@@ -730,11 +885,13 @@ BillerAdapter <|.. TopUpNetAdapter
 BatchBillerAdapter <|.. NetCoBatchAdapter
 BillerAdapterFactory ..> BillerAdapter : selects
 BillerAdapterFactory ..> BatchBillerAdapter : selects
+BillerAdapterFactory ..> ConfigurationService : configured adapter registry
 BillerAdapter ..> BillInquiryResult
 BillerAdapter ..> BillerPaymentRequest
 BillerAdapter ..> BillerPaymentResult
 BillerPaymentResult ..> BillerOutcome
 TopUpNetAdapter ..> BillerCallbackLog : logs
+TopUpNetAdapter ..> AuditService : logs duplicate callbacks
 
 ' ---------- Fees and Commissions relations ----------
 FeeStrategy <|.. FixedFeeStrategy
@@ -790,8 +947,11 @@ note bottom of Wallet
   No stored balance field.
   Available and held balances are computed
   from the sum of ledger entries per bucket.
-  A hold writes two entries:
-  AVAILABLE negative and HELD positive.
+  Every financial operation has a unique FinancialMovement
+  idempotency key and may append multiple ledger entries.
+  A hold writes AVAILABLE negative and HELD positive postings.
+  Check and reserve against the ledger-derived available total
+  atomically; competing holds cannot reserve the same funds.
 end note
 
 note bottom of Account
@@ -803,35 +963,63 @@ end note
 note bottom of PaymentState
   State pattern. Only the transitions of the brief are allowed.
   Any other event is rejected with an invalid-transition error.
-  Every transition adds a PaymentStatusHistory row.
+  Every transition adds a PaymentStatusHistory row. Failed ->
+  Refunded occurs with successful hold release. Completed, Rejected
+  and Refunded are terminal; FR-27 does not add Completed -> Refunded.
 end note
 
 note bottom of RefundRequest
   Refund of a Completed payment (FR-27).
   Separate from the Failed to Refunded hold release,
-  which is a state transition plus a RELEASE ledger entry.
+  which is a Failed -> Refunded transition plus a RELEASE movement.
+  On 2026-11-25 the user approved deferring FR-27 implementation
+  and method/amount/ledger definition until team/TA resolves AQ-07/AQ-12.
+  The user separately approved one authorized Support-role reviewer
+  and an audit record of actor, timestamp, outcome, reason, payment/refund
+  identifiers and any resulting ledger movement; no dual control is proposed.
+  Team/TA confirmation is pending; neither is team/TA approval. No
+  completed-refund method or state transition is approved.
 end note
 
 note bottom of InquireBillerStatusCommand
   Command pattern. Re-queries the biller after
-  1, 5 and 15 minutes. It never re-sends the payment.
+  User-approved AQ-15 offsets (2026-11-25): 1, 5 and 15 minutes
+  from Unknown entry. Rationale: deterministic times from the start of
+  the unresolved state. This is user approval, not team/TA approval.
+  It never re-sends the payment.
 end note
 
 note bottom of FraudRuleHandler
   Chain of Responsibility.
   Order: AccountStatus, SingleLimit, DailyLimit, Velocity.
   Limits and windows are read from ConfigurationService.
+  User-approved AQ-14 interpretation (2026-11-25): count payment initiation
+  attempts including those later rejected. This is user approval, not a claim
+  of team/TA approval. Rationale: prevent rapid activity evading the rule
+  through rejected outcomes. Daily limit composition remains open.
   The caller builds FraudCheckContext and applies blockAccountUntil.
 end note
 
 note bottom of ElectroCoAdapter
-  ElectroCo API v2 (new field names, piasters, signed requests)
-  changes only this adapter.
+  Phase 2 API v2 change (field mapping, piaster conversion,
+  request signing) is confined to this adapter.
+end note
+
+note right of BillerService
+  Catalog fields include biller-specific inputs such as
+  ElectroCo meter number and TopUpNet phone number.
 end note
 
 note bottom of BillerAdapterFactory
-  Factory pattern. Adding a biller means one new adapter
-  plus configuration. No other module changes.
+  Factory selects by biller code from the configured adapter registry.
+  Adding a biller means one new adapter plus registry/configuration;
+  unrelated modules and the payment workflow do not change.
+end note
+
+note bottom of TopUpNetAdapter
+  `accepted` is a pending integration result, not a payment state.
+  Payment stays SentToBiller until a definitive callback; callback
+  state changes are validated by PaymentState.
 end note
 
 note bottom of ConfigurationItem

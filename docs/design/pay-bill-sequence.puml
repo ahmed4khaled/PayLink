@@ -5,60 +5,89 @@ autonumber
 
 actor Customer
 actor Agent
+participant "Initiating Customer / Agent" as Caller
 participant "Payment API" as API
+participant "AuthenticationService" as Auth
 participant "PaymentService" as PS
 participant "AccountService" as AS
 participant "FraudRuleHandler\n(Chain of Responsibility)" as Fraud
 participant "FeeCalculator" as Fee
+participant "CommissionCalculator" as Commission
 participant "WalletService" as Wallet
 participant "BillerAdapterFactory" as Factory
 participant "BillerAdapter" as Biller
 participant "PaymentEventPublisher" as Events
 participant "NotificationService" as Notify
+participant "NotificationProvider" as NotifProvider
 participant "RetryScheduler" as Scheduler
+participant "ReconciliationService" as Reconcile
+participant "AuditService" as Audit
 database "PayLink Database" as DB
 
-alt Customer-initiated payment
-    Customer -> API : Pay bill(request)
-else Agent-assisted payment
-    Agent -> API : Submit payment for customer
+alt Customer flow
+    Customer -> API : Login / begin bill-payment flow
+else Agent-assisted flow
+    Agent -> API : Begin bill-payment flow for customer
 end
-
+API -> Auth : Authenticate and authorize caller
+Auth --> API : Authenticated principal / role
+alt Customer inquires
+    Customer -> API : Inquire bill (meter number / service input)
+else Agent inquires for customer
+    Agent -> API : Inquire bill for customer
+end
+API -> PS : inquireBill(serviceId, billerAccountRef)
+PS -> Factory : getAdapter(billerCode)
+Factory --> PS : BillerAdapter
+PS -> Biller : inquireBill(meter number / service input)
+Biller --> PS : amount due
+PS -> Fee : quote(service, amountDue, date)
+Fee --> PS : bill amount + service fee + total
+PS --> API : BillQuote
+alt Customer flow
+    API --> Customer : Show bill amount, fee and total; request confirmation
+else Agent-assisted flow
+    API --> Agent : Show bill amount, fee and total for customer confirmation
+end
+alt Customer confirms
+    Customer -> API : Confirm payment with idempotency key
+else Agent confirms for customer
+    Agent -> API : Confirm payment with idempotency key
+end
 API -> PS : payBill(request)
 PS -> DB : Find payment by customer + idempotency key
 DB --> PS : Existing payment? / none
 
 alt Existing request with same key and same payload
     PS --> API : Return original payment
-    API --> Customer : Existing payment status
+    API --> Caller : Existing payment status
 else Same key with different payload
     PS --> API : Idempotency conflict
-    API --> Customer : Reject conflicting request
+    API --> Caller : Reject conflicting request
 else New payment
     PS -> DB : Load account, wallet, service, configuration
     DB --> PS : Account and service data
     PS -> AS : Check account status / verification
     AS --> PS : Account status
+    PS -> DB : Create Payment (Initiated) + status history
     PS -> Fraud : Evaluate context
     Fraud -> Fraud : Account status rule
     Fraud -> Fraud : Single payment limit rule
     Fraud -> Fraud : Daily limit rule
-    Fraud -> Fraud : Velocity rule
+    Fraud -> Fraud : Velocity rule\n(count initiation attempts, including later-rejected;\nuser-approved AQ-14, 2026-11-25; prevent evasion through rejected outcomes)
     Fraud --> PS : FraudDecision
 
     alt Fraud rejected
-        PS -> DB : Save Payment as Rejected + status history
-        PS -> Events : Publish REJECTED event
-        Events -> Notify : onPaymentEvent(REJECTED)
-        Notify -> DB : Create and deliver notification
+        PS -> DB : Transition Initiated -> Rejected + status history
+        PS -> Events : Publish REJECTED event asynchronously
         PS --> API : Rejected payment
-        API --> Customer : Payment rejected
+        API --> Caller : Payment rejected
+        Events ->> Notify : Deliver rejection notification independently
     else Fraud approved
-        PS -> Fee : quote(service, billAmount, date)
-        Fee --> PS : FeeQuote
-        PS -> DB : Create Payment (Initiated)
-        PS -> Wallet : holdFunds(walletId, paymentId, totalAmount)
-        Wallet -> DB : Atomic ledger entries\nAVAILABLE -total / HELD +total
+        PS -> DB : Store fee quote and total on payment
+        PS -> Wallet : holdFunds(walletId, paymentId, totalAmount)\n[key = paymentId/HOLD; atomic, idempotent]
+        alt Atomic reservation succeeds
+        Wallet -> DB : Atomic ledger entries\nAVAILABLE -totalAmount / HELD +totalAmount
         DB --> Wallet : Hold recorded
         Wallet --> PS : Hold successful
         PS -> DB : Transition Initiated -> FundsHeld
@@ -70,49 +99,129 @@ else New payment
         alt Biller confirms within 10 seconds
             Biller --> PS : CONFIRMED + billerReference
             PS -> DB : Save biller outcome
-            PS -> Wallet : captureFunds(paymentId)
-            Wallet -> DB : Atomic ledger movement\nHELD debit + capture entries
+            PS -> Wallet : captureFunds(paymentId) [key = paymentId/CAPTURE; atomic, idempotent]
+            Wallet -> DB : Atomic capture: debit held total, record bill principal\nand credit PayLink fee-income ledger
             DB --> Wallet : Capture recorded
             Wallet --> PS : Captured
             PS -> PS : State -> Completed
             PS -> DB : Save status history + payment event
-            PS -> Events : Publish COMPLETED event
-            Events -> Notify : onPaymentEvent(COMPLETED)
-            Notify -> DB : Create notification\n(send/retry independently)
-
+            PS -> Audit : Record capture and fee-income movement
+            Audit -> DB : Append financial audit record
+            PS -> Events : Publish COMPLETED event asynchronously
             opt Agent-assisted payment
-                PS -> PS : Calculate 40% of service fee
-                PS -> Wallet : Credit agent commission once
-                Wallet -> DB : Append COMMISSION ledger entry
+                PS -> Commission : calculate(40% of service fee)
+                Commission --> PS : commission amount
+                PS -> Wallet : credit(agentWalletId, commissionAmount, COMMISSION)\n[key = paymentId/COMMISSION]
+                Wallet -> DB : Append COMMISSION movement and ledger entry once
+                Wallet -> Audit : Record commission movement
+                Audit -> DB : Append financial audit record
             end
 
             PS --> API : Completed payment
-            API --> Customer : Payment completed
+            API --> Caller : Payment completed
+            Events ->> Notify : onPaymentEvent(COMPLETED), independently
+            Notify -> DB : Create SMS and push notification records
+            Notify -> NotifProvider : Deliver SMS and push
+            opt SMS provider unavailable (HC-05)
+                loop Three additional SMS retries
+                    Notify -> NotifProvider : Retry SMS delivery
+                    NotifProvider --> Notify : Delivery failed
+                end
+                Notify -> DB : Mark SMS Undelivered after retry limit
+            end
 
         else Biller refuses within 10 seconds
-            Biller --> PS : REFUSED + reason
+            Biller --> PS : REFUSED + error code / reason
             PS -> DB : Save biller outcome
-            PS -> Wallet : releaseFunds(paymentId)
-            Wallet -> DB : Atomic ledger movement\nHELD debit / AVAILABLE credit
-            DB --> Wallet : Release recorded
-            Wallet --> PS : Released
             PS -> PS : State -> Failed
             PS -> DB : Save status history + payment event
-            PS -> Events : Publish FAILED event
-            Events -> Notify : onPaymentEvent(FAILED)
-            Notify -> DB : Create notification
+            PS -> Wallet : releaseFunds(paymentId) [key = paymentId/RELEASE; atomic, idempotent]
+            Wallet -> DB : Append release movement and ledger entries\nwith Failed -> Refunded transition atomically
+            DB --> Wallet : Release and transition recorded once
+            Wallet --> PS : Released; state Refunded
+            PS -> Audit : Record financial release
+            Audit -> DB : Append financial audit record
+            PS -> Events : Publish FAILED event asynchronously
             PS --> API : Failed payment
-            API --> Customer : Payment failed; funds released
+            API --> Caller : Payment failed; funds released (Refunded)
+            Events ->> Notify : onPaymentEvent(FAILED) independently
+            Notify -> DB : Create notification with error reason
 
-        else No response within 10 seconds
-            Biller --> PS : TIMEOUT / no response
+        else TopUpNet returns Accepted
+            Biller --> PS : ACCEPTED (not a final outcome)
+            PS -> DB : Record Accepted; remain SentToBiller
+            PS --> API : Payment processing
+            API --> Caller : Payment is being processed
+
+            loop Callback delivery (same success may be delivered twice; HC-06)
+                Biller -> PS : Callback(reference, outcome, fingerprint)
+                PS -> DB : Insert callback fingerprint / detect duplicate
+                alt Duplicate callback fingerprint
+                    DB --> PS : Duplicate
+                    PS -> Audit : Log duplicate callback fingerprint
+                    Audit -> DB : Append callback audit record
+                    PS --> Biller : Acknowledge duplicate
+                else First callback for this outcome
+                    DB --> PS : New callback
+                    PS -> PS : Validate requested transition with PaymentState
+                    alt Callback reports Success
+                        PS -> Wallet : captureFunds(paymentId) [key = paymentId/CAPTURE]
+                        Wallet -> DB : Capture held total, bill principal, and fee-income credit atomically
+                        PS -> DB : SentToBiller -> Completed + history
+                        PS -> Audit : Record capture and fee-income movement
+                        Audit -> DB : Append financial audit record
+                        PS -> Events : Publish COMPLETED event asynchronously
+                        Events ->> Notify : Notify customer independently
+                        opt Agent-assisted payment
+                            PS -> Commission : calculate(40% of service fee)
+                            Commission --> PS : commission amount
+                            PS -> Wallet : credit(agentWalletId, commissionAmount, COMMISSION)\n[key = paymentId/COMMISSION]
+                            Wallet -> DB : Credit 40% of fee to agent wallet once
+                            Wallet -> Audit : Record commission movement
+                            Audit -> DB : Append financial audit record
+                        end
+                    else Callback reports Failed
+                        PS -> DB : SentToBiller -> Failed + history
+                        PS -> Wallet : releaseFunds(paymentId) [key = paymentId/RELEASE]
+                        Wallet -> DB : Release ledger movement and Failed -> Refunded atomically
+                        DB --> Wallet : Released once; payment Refunded
+                        PS -> Audit : Record financial release
+                        Audit -> DB : Append financial audit record
+                        PS -> Events : Publish FAILED event asynchronously
+                        Events ->> Notify : Notify customer with failure reason
+                    end
+                end
+            end
+
+        else No response from a live biller within 10 seconds
+            Biller --> PS : No response at 10 seconds\n(HC-02 response arrives at 12 seconds)
             PS -> DB : Save outcome; State -> Unknown
             PS -> DB : Save status history
             PS -> Scheduler : scheduleInquiries(paymentId)
-            Scheduler -> DB : Store inquiries at +1, +5, +15 minutes
+            Scheduler -> DB : Store inquiries at +1, +5, +15 minutes\n(anchor: Unknown entry; user-approved AQ-15, 2026-11-25; deterministic schedule)
             PS --> API : Unknown payment status
-            API --> Customer : Payment pending confirmation\nFunds remain held
+            API --> Caller : Payment pending confirmation\nFunds remain held
 
+            alt Original ElectroCo response arrives at 12 seconds (HC-02)
+                Biller --> PS : Late definitive outcome
+                alt Biller confirms success
+                    PS -> Wallet : captureFunds(paymentId) [key = paymentId/CAPTURE]
+                    Wallet -> DB : Capture held total and fee income once
+                    PS -> DB : Unknown -> Completed + history
+                    PS -> Audit : Record capture and fee-income movement
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish COMPLETED asynchronously
+                    Events ->> Notify : Notify customer independently
+                else Biller definitively refuses
+                    PS -> DB : Unknown -> Failed + history
+                    PS -> Wallet : releaseFunds(paymentId) [key = paymentId/RELEASE]
+                    Wallet -> DB : Release movement and Failed -> Refunded atomically
+                    PS -> Audit : Record financial release
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish FAILED asynchronously
+                    Events ->> Notify : Notify customer with reason
+                end
+            else No late response before a scheduled inquiry
             loop Each scheduled inquiry (1, 5, 15 minutes)
                 Scheduler -> PS : Execute status inquiry
                 PS -> Factory : getAdapter(billerCode)
@@ -121,20 +230,23 @@ else New payment
 
                 alt Status confirmed completed
                     Biller --> PS : CONFIRMED
-                    PS -> Wallet : captureFunds(paymentId)
-                    Wallet -> DB : Capture held funds once
+                    PS -> Wallet : captureFunds(paymentId) [key = paymentId/CAPTURE; atomic, idempotent]
+                    Wallet -> DB : Capture held total, bill principal, and fee-income credit once
                     PS -> DB : State -> Completed + history
-                    PS -> Events : Publish COMPLETED
-                    Events -> Notify : Notify customer
-                    break Definitive outcome received
+                    PS -> Audit : Record capture and fee-income movement
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish COMPLETED asynchronously
+                    Events ->> Notify : Notify customer
                 else Status definitively refused
                     Biller --> PS : REFUSED
-                    PS -> Wallet : releaseFunds(paymentId)
-                    Wallet -> DB : Release held funds once
-                    PS -> DB : State -> Failed + history
-                    PS -> Events : Publish FAILED
-                    Events -> Notify : Notify customer
-                    break Definitive outcome received
+                    PS -> DB : State Unknown -> Failed + history
+                    PS -> Wallet : releaseFunds(paymentId) [key = paymentId/RELEASE; atomic, idempotent]
+                    Wallet -> DB : Append release movement and ledger entries\nwith Failed -> Refunded transition atomically
+                    DB --> Wallet : Release and transition recorded once
+                    PS -> Audit : Record financial release
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish FAILED asynchronously
+                    Events ->> Notify : Notify customer
                 else Still pending / no answer
                     Biller --> PS : ACCEPTED_PENDING / TIMEOUT
                     PS -> DB : Record inquiry attempt
@@ -150,8 +262,92 @@ else New payment
                 payment remains Unknown until reconciliation
                 or a late authoritative biller callback.
             end note
+
+            opt Late biller response/callback or authoritative settlement evidence
+                alt Callback or settlement confirms success
+                    Biller --> PS : Late CONFIRMED response or callback
+                    Reconcile -> PS : Apply matching definitive success
+                    PS -> Wallet : captureFunds(paymentId) [key = paymentId/CAPTURE; atomic, idempotent]
+                    Wallet -> DB : Capture held total, bill principal, and fee-income credit once
+                    PS -> DB : Unknown -> Completed + history
+                    PS -> Audit : Record capture and fee-income movement
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish COMPLETED asynchronously
+                    Events ->> Notify : Notify customer independently
+                else Callback or settlement confirms failure
+                    Biller --> PS : Late REFUSED callback
+                    Reconcile -> PS : Apply matching definitive failure
+                    PS -> DB : Unknown -> Failed + history
+                    PS -> Wallet : releaseFunds(paymentId) [key = paymentId/RELEASE; atomic, idempotent]
+                    Wallet -> DB : Append release movement and ledger entries\nwith Failed -> Refunded transition atomically
+                    DB --> Wallet : Release and transition recorded once
+                    PS -> Audit : Record financial release
+                    Audit -> DB : Append financial audit record
+                    PS -> Events : Publish FAILED asynchronously
+                    Events ->> Notify : Notify customer independently
+                end
+            end
+            end
+        end
+        else Insufficient available funds at atomic reservation
+            Wallet --> PS : INSUFFICIENT_AVAILABLE
+            PS -> DB : Initiated -> Rejected + status history
+            PS -> Events : Publish REJECTED event asynchronously
+            Events ->> Notify : Notify customer with insufficient-funds reason
+            PS --> API : Rejected; no hold created
+            API --> Caller : Payment rejected
         end
     end
 end
+
+note over PS,Wallet
+    The hold uses the full totalAmount (bill amount + fee), as
+    shown by Sara's 350.00 + 2.50 = 352.50 EGP example.
+    Capture and release execute once with their payment outcome;
+    notifications are independent and cannot change that outcome.
+end note
+
+note over Wallet,DB
+    Competing holds recheck the same ledger-derived available balance
+    atomically. When funds cover only one request, one hold succeeds;
+    the other returns insufficient funds and is Rejected. The balance
+    cannot become negative (HC-04).
+end note
+
+note over PS,DB
+    The hold with Initiated -> FundsHeld, each capture with its
+    success transition, and each release with Failed -> Refunded
+    commit as one database unit of work. Publish payment events only
+    after commit; movement keys make each financial operation idempotent.
+end note
+
+note over Biller,DB
+    Callback fingerprints are unique in the database. Repeated
+    callbacks are logged and acknowledged without repeating any
+    state transition, capture, release, or commission.
+end note
+
+note over Notify,NotifProvider
+    Delivery is independent from the payment outcome. Failed SMS or
+    email gets three additional retries, then Undelivered. Push retry
+    behavior remains open (AQ-16).
+end note
+
+note over PS,Commission
+    On every successful completion path (immediate response, callback,
+    inquiry, or reconciliation), credit 40% of the service fee to the
+    agent wallet only for agent-assisted payments, once per payment.
+end note
+
+note over Auth,API
+    Credential fields and agent credential lifecycle remain
+    unspecified (AQ-01/AQ-04); this sequence adds no credential rule.
+end note
+
+note right of Caller
+    Caller is the Customer or Agent that initiated the current flow;
+    this lifeline is a shared response destination, not a third role.
+    Payment notifications to the customer remain a separate flow.
+end note
 
 @enduml

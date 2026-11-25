@@ -28,6 +28,8 @@ Each adapter converts PayLink requests into the format expected by the selected 
 
 The adapter also helps isolate biller-specific response formats and error codes from the core payment processing logic.
 
+The Phase 2 ElectroCo API v2 change (renamed fields, amounts in piasters, and signed requests) is implemented inside ElectroCoAdapter; the common `Money` and biller request interfaces remain unchanged.
+
 **Benefit:**
 
 New billers can be integrated without changing the core payment processing logic.
@@ -43,6 +45,8 @@ The Factory Pattern centralizes the creation or selection of the appropriate bil
 **Application in PayLink:**
 
 When a payment or inquiry identifies a biller, the factory selects the corresponding adapter, such as ElectroCoAdapter, AquaCoAdapter, or TopUpNetAdapter.
+
+The factory resolves biller codes through a configured adapter registry, so registering a new adapter does not require changes to payment orchestration or unrelated modules.
 
 **Benefit:**
 
@@ -63,7 +67,7 @@ PayLink uses different fee calculation strategies:
 - Electricity and Water: Fixed fee of 2.50 EGP.
 - Mobile Top-Up: 1.5% of the payment amount, with a minimum fee of 1 EGP.
 - Internet: 2 EGP for payments up to and including 200 EGP and 4 EGP for payments above 200 EGP.
-- Promotions may reduce the service fee to zero for eligible billers and time periods.
+- A promotion waives the service fee for its one configured biller during the configured date range.
 
 Each calculation rule can be represented by a separate fee strategy.
 
@@ -108,6 +112,8 @@ The payment lifecycle defines the permitted transitions:
 
 Completed, Rejected, and Refunded are terminal states in the defined payment lifecycle.
 
+The required release after definitive failure records `Failed` first, then the idempotent hold release records `Refunded`. `Failed` is not a terminal state until this required release completes. On 2026-11-25, the user approved deferring optional FR-27 implementation and its refund-method, amount/eligibility and ledger definition until team/TA resolution of AQ-07 and AQ-12. This is user approval, not team/TA approval. FR-27 does not establish a `Completed → Refunded` payment transition or select a completed-refund method.
+
 **Important Distinction:**
 
 The Failed-to-Refunded transition represents releasing funds previously held for a failed payment.
@@ -138,7 +144,7 @@ A payment request may pass through checks such as:
 
 Each check evaluates the request and either allows processing to continue or rejects it according to the applicable rules.
 
-The velocity rule blocks new payment attempts for 10 minutes when more than 5 payment attempts occur within a rolling 60-second window.
+The brief blocks new payment attempts for 10 minutes when more than 5 payments occur within 60 seconds. **User-approved AQ-14 interpretation (2026-11-25):** count payment initiation attempts, including attempts later rejected. Rationale: detect rapid repeated activity before it can evade the rule through rejected outcomes. This records user approval only; daily-limit fee/rejected-attempt calculation remains open.
 
 **Benefit:**
 
@@ -154,7 +160,7 @@ The Observer Pattern allows interested components to be notified when an importa
 
 **Application in PayLink:**
 
-Payment events such as successful completion, confirmed failure, or refund can generate notification events.
+Payment completion and confirmed failure notifications are required by FR-22. Notifications for Rejected outcomes or separate refund events are optional proposals and require team approval before becoming mandatory.
 
 The Notifications Module receives the relevant event and sends the appropriate message through the configured notification provider.
 
@@ -170,7 +176,7 @@ Payment processing does not need to depend directly on notification delivery. No
 
 ### 2.7 Command Pattern
 
-**Used In:** Payment Retry Handling
+**Used In:** Payment Processing Module (scheduled status inquiries)
 
 **Purpose:**
 
@@ -182,9 +188,11 @@ When a payment enters the Unknown state, PayLink schedules biller status inquiry
 
 The inquiry schedule is:
 
-- First inquiry: 1 minute after entering Unknown.
-- Second inquiry: 5 minutes after entering Unknown.
-- Third inquiry: 15 minutes after entering Unknown.
+- User-approved first inquiry: 1 minute after entering Unknown (AQ-15, 2026-11-25).
+- User-approved second inquiry: 5 minutes after entering Unknown (AQ-15, 2026-11-25).
+- User-approved third inquiry: 15 minutes after entering Unknown (AQ-15, 2026-11-25).
+
+The Student Brief specifies the three offsets but not their anchor. The user approved measuring all offsets from entry into `Unknown` on 2026-11-25. Rationale: deterministic retry times from the start of the unresolved state. This records user approval and does not claim team/TA approval.
 
 Each command checks the existing payment outcome. It must not create a new payment, repeat the original payment request, or cause another wallet deduction.
 
@@ -204,7 +212,7 @@ Retry operations are separated from the original payment workflow, allowing cont
 | State | Payment Processing | Control payment lifecycle transitions |
 | Chain of Responsibility | Fraud Checks | Organize sequential fraud validation |
 | Observer | Notifications | React to payment events |
-| Command | Payment Retry Handling | Encapsulate scheduled status inquiries |
+| Command | Payment Processing | Encapsulate scheduled status inquiries |
 
 ## 4. Design Considerations
 
