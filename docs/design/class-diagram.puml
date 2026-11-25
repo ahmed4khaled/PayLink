@@ -1,0 +1,1031 @@
+@startuml
+title PayLink - Domain Class Diagram
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+hide empty members
+
+' ---------- Shared kernel ----------
+package "Shared Kernel" {
+  class Money <<value>> {
+    +amount : Decimal
+    +currency : String
+    +add(other : Money) : Money
+    +subtract(other : Money) : Money
+    +multiply(factor : Decimal) : Money
+    +isNegative() : Boolean
+  }
+}
+
+' ---------- Accounts and Wallet ----------
+package "Accounts and Wallet" {
+  enum AccountRole {
+    CUSTOMER
+    AGENT
+    ADMIN
+    SUPPORT
+    SYSTEM
+  }
+
+  enum VerificationLevel {
+    BASIC
+    VERIFIED
+  }
+
+  enum LedgerEntryType {
+    TOP_UP_CARD
+    TOP_UP_AGENT_CASH
+    HOLD
+    RELEASE
+    CAPTURE
+    FEE_INCOME
+    COMMISSION
+    REFUND
+  }
+
+  enum BalanceBucket {
+    AVAILABLE
+    HELD
+  }
+
+  enum HoldResult {
+    HELD
+    INSUFFICIENT_AVAILABLE
+  }
+
+  enum TopUpMethod {
+    CARD
+    AGENT_CASH
+  }
+
+  enum TopUpStatus {
+    PENDING
+    COMPLETED
+    FAILED
+  }
+
+  enum BlockReason {
+    VELOCITY
+    SUPPORT_MANUAL
+  }
+
+  class Account <<entity>> {
+    +accountId : UUID
+    +role : AccountRole
+    +verificationLevel : VerificationLevel
+    +createdAt : DateTime
+    +isBlocked(at : DateTime) : Boolean
+  }
+
+  class Wallet <<entity>> {
+    +walletId : UUID
+    +accountId : UUID
+    +createdAt : DateTime
+    +/availableBalance : Money
+    +/heldBalance : Money
+  }
+
+  class LedgerEntry <<entity>> {
+    +entryId : UUID
+    +movementId : UUID
+    +walletId : UUID
+    +type : LedgerEntryType
+    +bucket : BalanceBucket
+    +amount : Money
+    +paymentId : UUID?
+    +createdAt : DateTime
+    +createdBy : UUID
+    +reason : String
+  }
+
+  class FinancialMovement <<entity>> {
+    +movementId : UUID
+    +idempotencyKey : String
+    +type : LedgerEntryType
+    +paymentId : UUID?
+    +refundPaymentId : UUID?
+    +topUpId : UUID?
+    +createdAt : DateTime
+  }
+
+  class TopUp <<entity>> {
+    +topUpId : UUID
+    +walletId : UUID
+    +method : TopUpMethod
+    +amount : Money
+    +agentAccountId : UUID?
+    +status : TopUpStatus
+    +gatewayReference : String?
+    +createdAt : DateTime
+  }
+
+  class AccountBlock <<entity>> {
+    +blockId : UUID
+    +accountId : UUID
+    +reason : BlockReason
+    +blockedAt : DateTime
+    +blockedUntil : DateTime?
+    +blockedBy : UUID?
+    +unblockedAt : DateTime?
+  }
+
+  interface CardPaymentGateway {
+    +charge(amount : Money, cardToken : String) : Boolean
+  }
+
+  class SimulatedCardGateway
+
+  class AccountService <<service>> {
+    +register() : Account
+    +upgradeToVerified(accountId : UUID) : void
+    +blockAccount(accountId : UUID, reason : BlockReason, until : DateTime?) : void
+    +unblockAccount(accountId : UUID) : void
+  }
+
+  class WalletService <<service>> {
+    +topUpByCard(walletId : UUID, amount : Money, cardToken : String) : TopUp
+    +topUpByAgent(agentId : UUID, walletId : UUID, amount : Money) : TopUp
+    +holdFunds(walletId : UUID, paymentId : UUID, totalAmount : Money) : HoldResult
+    +captureFunds(paymentId : UUID) : void
+    +releaseFunds(paymentId : UUID) : void
+    +credit(walletId : UUID, amount : Money, type : LedgerEntryType, reason : String) : LedgerEntry
+    +getTransactions(walletId : UUID) : List<LedgerEntry>
+  }
+}
+
+' ---------- Authentication ----------
+package "Authentication" {
+  class AuthenticationRequest <<value>> {
+    +loginIdentifier : String
+    +password : Secret
+  }
+
+  class AuthenticatedPrincipal <<value>> {
+    +accountId : UUID
+    +authorities : Set<AccountRole>
+  }
+
+  class AccountCredentials <<entity>> {
+    +credentialId : UUID
+    +accountId : UUID
+    +passwordHash : Argon2idHash
+    +failedLoginAttempts : Integer
+    +lockedUntil : DateTime?
+    +passwordUpdatedAt : DateTime
+    +createdAt : DateTime
+    +updatedAt : DateTime
+  }
+
+  class LoginSession <<entity>> {
+    +sessionId : UUID
+    +accountId : UUID
+    +tokenHash : String
+    +createdAt : DateTime
+    +expiresAt : DateTime
+    +lastActivityAt : DateTime
+    +revokedAt : DateTime?
+    +ipAddress : String?
+    +userAgent : String?
+  }
+
+  class SessionSummary <<value>> {
+    +sessionId : UUID
+    +createdAt : DateTime
+    +expiresAt : DateTime
+    +lastActivityAt : DateTime
+    +ipAddress : String?
+    +userAgent : String?
+  }
+
+  interface AuthenticationService {
+    +authenticate(request : AuthenticationRequest) : AuthenticatedPrincipal
+    +validateSession(rawToken : Secret) : AuthenticatedPrincipal
+    +changePassword(accountId : UUID, currentPassword : Secret, newPassword : Secret) : void
+    +initiatePasswordReset(identifier : String) : void
+    +logout(sessionId : UUID) : void
+    +logoutAll(accountId : UUID) : void
+    +recordFailedLogin(accountId : UUID) : void
+  }
+
+  class SessionManager <<service>> {
+    +createSession(accountId : UUID) : Secret
+    +validateSession(rawToken : Secret) : AuthenticatedPrincipal?
+    +activeSessions(accountId : UUID) : List<SessionSummary>
+    +revokeSession(sessionId : UUID) : void
+    +revokeAllActive(accountId : UUID) : void
+  }
+
+  interface AccountRepository <<repository>> {
+    +findForAuthentication(identifier : String) : Account?
+    +findById(accountId : UUID) : Account?
+  }
+
+  interface AccountCredentialsRepository <<repository>> {
+    +findByAccountId(accountId : UUID) : AccountCredentials?
+    +save(credentials : AccountCredentials) : void
+  }
+
+  interface LoginSessionRepository <<repository>> {
+    +save(session : LoginSession) : void
+    +findActiveByTokenHash(tokenHash : String) : LoginSession?
+    +findActiveByAccountId(accountId : UUID) : List<LoginSession>
+    +revoke(sessionId : UUID, at : DateTime) : void
+    +revokeAllActive(accountId : UUID, at : DateTime) : void
+  }
+
+  interface "PasswordEncoder\n(org.springframework.security.crypto.password.PasswordEncoder)" as PasswordEncoder <<Spring Security>>
+  class "Argon2PasswordEncoder\n(org.springframework.security.crypto.argon2.Argon2PasswordEncoder)" as Argon2PasswordEncoder <<Spring Security>>
+  class AuthenticationFilter <<Spring Security>>
+  class SecurityContext <<Spring Security>>
+
+  AuthenticationService ..> PasswordEncoder : injected
+  Argon2PasswordEncoder ..|> PasswordEncoder
+  AuthenticationService ..> AccountRepository
+  AuthenticationService ..> AccountCredentialsRepository
+  AuthenticationService ..> SessionManager
+  SessionManager ..> LoginSessionRepository
+  AuthenticationFilter ..> SessionManager : extracts cookie token / validates
+  AuthenticationFilter ..> SecurityContext : establishes identity and authorities
+  AccountRepository ..> Account
+  AccountCredentialsRepository ..> AccountCredentials
+  LoginSessionRepository ..> LoginSession
+  SessionManager ..> SessionSummary : returns without token hash
+  Account "1" -- "0..1" AccountCredentials
+  Account "1" -- "0..*" LoginSession
+}
+
+note right of AuthenticationService
+  Authentication is implemented internally in PayLink; no external
+  provider or JWT-only stateless session design is used. The existing
+  Spring Security PasswordEncoder interface is injected through DI;
+  Argon2PasswordEncoder is its configured implementation. No custom
+  PasswordHasher or manual hashing implementation is introduced.
+  loginIdentifier is a generic placeholder. The user approved deferring
+  selection until account provisioning for all roles is defined (AQ-04,
+  2026-11-25). This is not team/TA approval; do not assume phone, email,
+  username, or another key. Rationale: the brief selects no credential key.
+  Password reset policy also needs clarification.
+end note
+
+note right of SessionManager
+  Generate cryptographically secure random session tokens. Return the
+  raw value only to the authentication response/cookie path; persist
+  only its secure hash. Reject unknown, expired, or revoked sessions.
+  Active means not expired and not revoked. Revoke one or all sessions.
+end note
+
+note right of AuthenticationFilter
+  Read the token from a Secure, HttpOnly cookie with an appropriate
+  SameSite setting. Apply CSRF protection to cookie-authenticated state
+  changes. Establish account identity and database-derived authorities
+  in SecurityContext; never trust client-supplied roles.
+end note
+
+' ---------- Biller Catalog ----------
+package "Biller Catalog" {
+  enum BillerCategory {
+    ELECTRICITY
+    WATER
+    MOBILE_TOPUP
+    INTERNET
+  }
+
+  enum BillerProtocol {
+    REST_JSON
+    SOAP_XML
+    REST_JSON_ASYNC
+    BATCH_CSV
+  }
+
+  class Biller <<entity>> {
+    +billerId : UUID
+    +code : String
+    +name : String
+    +protocol : BillerProtocol
+    +active : Boolean
+  }
+
+  class BillerService <<entity>> {
+    +serviceId : UUID
+    +billerId : UUID
+    +name : String
+    +category : BillerCategory
+    +minAmount : Money
+    +maxAmount : Money
+    +active : Boolean
+  }
+
+  class ServiceInputField <<entity>> {
+    +fieldId : UUID
+    +serviceId : UUID
+    +fieldName : String
+    +label : String
+    +dataType : String
+    +validationPattern : String
+    +required : Boolean
+  }
+
+  class BillerCatalogService <<service>> {
+    +listActiveBillers() : List<Biller>
+    +getRequiredFields(serviceId : UUID) : List<ServiceInputField>
+    +addBiller(biller : Biller) : Biller
+    +editBiller(biller : Biller) : Biller
+    +disableBiller(billerId : UUID) : void
+    +disableService(serviceId : UUID) : void
+  }
+}
+
+' ---------- Payment Processing ----------
+package "Payment Processing" {
+  enum PaymentEventType {
+    COMPLETED
+    FAILED
+    REJECTED
+    REFUNDED
+  }
+
+  enum RefundStatus {
+    REQUESTED
+    APPROVED
+    REJECTED
+    PROCESSED
+  }
+
+  enum AttemptResult {
+    PENDING
+    CONFIRMED
+    REFUSED
+    NO_ANSWER
+  }
+
+  class PayBillRequest <<value>> {
+    +customerAccountId : UUID
+    +agentAccountId : UUID?
+    +serviceId : UUID
+    +billerAccountRef : String
+    +billAmount : Money
+    +idempotencyKey : String
+  }
+
+  class Payment <<entity>> {
+    +paymentId : UUID
+    +reference : String
+    +idempotencyKey : String
+    +customerAccountId : UUID
+    +agentAccountId : UUID?
+    +walletId : UUID
+    +billerServiceId : UUID
+    +billerAccountRef : String
+    +billerReference : String?
+    +billAmount : Money
+    +serviceFee : Money
+    +totalAmount : Money
+    +state : PaymentState
+    +reason : String?
+    +createdAt : DateTime
+    +updatedAt : DateTime
+    +markFundsHeld() : void
+    +reject(reason : String) : void
+    +markSentToBiller() : void
+    +confirm(billerReference : String) : void
+    +refuse(reason : String) : void
+    +markUnknown() : void
+    +markRefundedAfterRelease() : void
+  }
+
+  abstract class PaymentState {
+    +name() : String
+    +isFinal() : Boolean
+    +markFundsHeld(payment : Payment) : void
+    +reject(payment : Payment, reason : String) : void
+    +markSentToBiller(payment : Payment) : void
+    +confirm(payment : Payment, billerReference : String) : void
+    +refuse(payment : Payment, reason : String) : void
+    +markUnknown(payment : Payment) : void
+    +release(payment : Payment) : void
+  }
+
+  class InitiatedState
+  class FundsHeldState
+  class SentToBillerState
+  class UnknownState
+  class FailedState
+  class CompletedState <<terminal>>
+  class RejectedState <<terminal>>
+  class RefundedState <<terminal>>
+
+  class PaymentStatusHistory <<entity>> {
+    +historyId : UUID
+    +paymentId : UUID
+    +fromState : String?
+    +toState : String
+    +event : String
+    +source : String
+    +reason : String?
+    +occurredAt : DateTime
+  }
+
+  class StatusInquiryAttempt <<entity>> {
+    +attemptId : UUID
+    +paymentId : UUID
+    +attemptNumber : Integer
+    +scheduledFor : DateTime
+    +executedAt : DateTime?
+    +result : AttemptResult
+  }
+
+  class RefundRequest <<entity>> {
+    +refundRequestId : UUID
+    +paymentId : UUID
+    +requestedBy : UUID
+    +status : RefundStatus
+    +decidedBy : UUID?
+    +decisionReason : String?
+    +createdAt : DateTime
+    +decidedAt : DateTime?
+    +processedAt : DateTime?
+  }
+
+  class PaymentEvent <<value>> {
+    +eventId : UUID
+    +paymentId : UUID
+    +type : PaymentEventType
+    +occurredAt : DateTime
+  }
+
+  interface PaymentEventListener {
+    +onPaymentEvent(event : PaymentEvent) : void
+  }
+
+  class PaymentEventPublisher {
+    +subscribe(listener : PaymentEventListener) : void
+    +unsubscribe(listener : PaymentEventListener) : void
+    +publish(event : PaymentEvent) : void
+  }
+
+  interface PaymentCommand {
+    +execute() : void
+  }
+
+  class InquireBillerStatusCommand {
+    +paymentId : UUID
+    +attemptNumber : Integer
+    +execute() : void
+  }
+
+  class RetryScheduler {
+    +scheduleInquiries(paymentId : UUID) : void
+    +runDueCommands() : void
+  }
+
+  class PaymentService <<application service>> {
+    +inquireBill(serviceId : UUID, billerAccountRef : String) : FeeQuote
+    +payBill(request : PayBillRequest) : Payment
+    +applyBillerOutcome(reference : String, outcome : BillerOutcome, source : String) : Payment
+    +getTracking(paymentId : UUID) : Payment
+    +searchByReference(reference : String) : Payment
+  }
+
+  class RefundService <<application service>> {
+    +submitRequest(paymentId : UUID, requestedBy : UUID) : RefundRequest
+    +review(refundRequestId : UUID) : RefundRequest
+    +decide(refundRequestId : UUID, approved : Boolean, decidedBy : UUID, reason : String) : RefundRequest
+    +processApproved(refundRequestId : UUID) : void
+  }
+}
+
+' ---------- Biller Integration ----------
+package "Biller Integration" {
+  enum BillerOutcome {
+    CONFIRMED
+    REFUSED
+    ACCEPTED_PENDING
+    TIMEOUT
+  }
+
+  enum CallbackOutcome {
+    APPLIED
+    DUPLICATE_IGNORED
+    UNKNOWN_REFERENCE
+  }
+
+  class BillInquiryResult <<value>> {
+    +success : Boolean
+    +amountDue : Money?
+    +errorCode : String?
+    +message : String?
+  }
+
+  class BillerPaymentRequest <<value>> {
+    +paymentReference : String
+    +billerAccountRef : String
+    +amount : Money
+  }
+
+  class BillerPaymentResult <<value>> {
+    +outcome : BillerOutcome
+    +billerReference : String?
+    +errorCode : String?
+    +reason : String?
+  }
+
+  interface BillerAdapter {
+    +billerCode() : String
+    +inquireBill(billerAccountRef : String) : BillInquiryResult
+    +submitPayment(request : BillerPaymentRequest) : BillerPaymentResult
+    +inquirePaymentStatus(paymentReference : String) : BillerPaymentResult
+  }
+
+  interface BatchBillerAdapter {
+    +billerCode() : String
+    +uploadDailyBatch(requests : List<BillerPaymentRequest>) : void
+    +readResultFile() : List<BillerPaymentResult>
+  }
+
+  class ElectroCoAdapter
+  class AquaCoAdapter
+  class TopUpNetAdapter {
+    +handleCallback(payload : String) : CallbackOutcome
+  }
+  class NetCoBatchAdapter <<optional>>
+
+  class BillerAdapterFactory {
+    +getAdapter(billerCode : String) : BillerAdapter
+    +getBatchAdapter(billerCode : String) : BatchBillerAdapter
+  }
+
+  class BillerCallbackLog <<entity>> {
+    +callbackId : UUID
+    +billerCode : String
+    +paymentReference : String
+    +callbackFingerprint : String
+    +payload : String
+    +outcome : CallbackOutcome
+    +receivedAt : DateTime
+  }
+}
+
+' ---------- Fees and Commissions ----------
+package "Fees and Commissions" {
+  enum FeeStrategyType {
+    FIXED
+    PERCENTAGE
+    TIERED
+  }
+
+  class FeeTier <<value>> {
+    +upToAmount : Money?
+    +fee : Money
+  }
+
+  class FeeRule <<entity>> {
+    +ruleId : UUID
+    +billerServiceId : UUID
+    +strategyType : FeeStrategyType
+    +fixedAmount : Money?
+    +percentageRate : Decimal?
+    +minimumFee : Money?
+    +active : Boolean
+  }
+
+  class Promotion <<entity>> {
+    +promotionId : UUID
+    +billerId : UUID
+    +startDate : Date
+    +endDate : Date
+    +active : Boolean
+    +feeWaived : Boolean
+    +isActiveOn(date : Date) : Boolean
+  }
+
+  interface FeeStrategy {
+    +calculate(amount : Money) : Money
+  }
+
+  class FixedFeeStrategy {
+    +fixedAmount : Money
+  }
+
+  class PercentageFeeStrategy {
+    +rate : Decimal
+    +minimumFee : Money
+  }
+
+  class TieredFeeStrategy {
+    +tiers : List<FeeTier>
+  }
+
+  class FeeQuote <<value>> {
+    +billAmount : Money
+    +serviceFee : Money
+    +totalAmount : Money
+    +promotionApplied : Boolean
+  }
+
+  class FeeCalculator <<service>> {
+    +quote(serviceId : UUID, billAmount : Money, on : Date) : FeeQuote
+  }
+
+  class CommissionCalculator <<service>> {
+    +calculate(serviceFee : Money) : Money
+  }
+
+  class Commission <<entity>> {
+    +commissionId : UUID
+    +paymentId : UUID
+    +agentAccountId : UUID
+    +amount : Money
+    +creditedAt : DateTime
+  }
+}
+
+' ---------- Fraud Checks ----------
+package "Fraud Checks" {
+  class FraudCheckContext <<value>> {
+    +accountId : UUID
+    +verificationLevel : VerificationLevel
+    +accountBlocked : Boolean
+    +requestedAmount : Money
+    +dailyTotal : Money
+    +recentPaymentCount : Integer
+    +evaluatedAt : DateTime
+  }
+
+  class FraudDecision <<value>> {
+    +approved : Boolean
+    +reasonCode : String?
+    +message : String?
+    +blockAccountUntil : DateTime?
+  }
+
+  abstract class FraudRuleHandler {
+    -next : FraudRuleHandler
+    +setNext(next : FraudRuleHandler) : FraudRuleHandler
+    +handle(context : FraudCheckContext) : FraudDecision
+    #check(context : FraudCheckContext) : FraudDecision
+  }
+
+  class AccountStatusRule
+  class SingleLimitRule
+  class DailyLimitRule
+  class VelocityRule
+}
+
+' ---------- Notifications ----------
+package "Notifications" {
+  enum NotificationChannel {
+    SMS
+    PUSH
+    EMAIL
+  }
+
+  enum NotificationStatus {
+    PENDING
+    SENT
+    UNDELIVERED
+  }
+
+  class Notification <<entity>> {
+    +notificationId : UUID
+    +paymentId : UUID
+    +recipientAccountId : UUID
+    +channel : NotificationChannel
+    +templateCode : String
+    +message : String
+    +status : NotificationStatus
+    +attempts : Integer
+    +lastAttemptAt : DateTime?
+    +createdAt : DateTime
+  }
+
+  class NotificationTemplate <<entity>> {
+    +templateCode : String
+    +eventType : PaymentEventType
+    +channel : NotificationChannel
+    +body : String
+  }
+
+  interface NotificationProvider {
+    +send(notification : Notification) : Boolean
+  }
+
+  class SmsProvider
+  class PushProvider
+  class EmailProvider
+
+  class NotificationService <<service>> {
+    +onPaymentEvent(event : PaymentEvent) : void
+    +retryFailed() : void
+  }
+}
+
+' ---------- Reconciliation ----------
+package "Reconciliation" {
+  enum DifferenceType {
+    MISSING_AT_BILLER
+    MISSING_IN_PAYLINK
+    STATUS_MISMATCH
+    AMOUNT_MISMATCH
+  }
+
+  enum ReviewStatus {
+    OPEN
+    REVIEWED
+  }
+
+  class SettlementFile <<entity>> {
+    +fileId : UUID
+    +billerCode : String
+    +businessDate : Date
+    +importedAt : DateTime
+  }
+
+  class SettlementRecord <<entity>> {
+    +recordId : UUID
+    +fileId : UUID
+    +paymentReference : String
+    +amount : Money
+    +reportedStatus : String
+  }
+
+  class ReconciliationReport <<entity>> {
+    +reportId : UUID
+    +businessDate : Date
+    +generatedAt : DateTime
+  }
+
+  class ReconciliationDifference <<entity>> {
+    +differenceId : UUID
+    +reportId : UUID
+    +paymentId : UUID?
+    +paymentReference : String
+    +type : DifferenceType
+    +paylinkState : String?
+    +billerStatus : String?
+    +reviewStatus : ReviewStatus
+    +reviewedBy : UUID?
+  }
+
+  class ReconciliationService <<service>> {
+    +importSettlement(file : SettlementFile) : void
+    +reconcile(businessDate : Date) : ReconciliationReport
+    +markReviewed(differenceId : UUID, reviewer : UUID) : void
+  }
+}
+
+' ---------- Audit and Configuration ----------
+package "Audit and Configuration" {
+  class AuditLogEntry <<entity>> {
+    +auditId : UUID
+    +actorId : UUID
+    +actorRole : AccountRole
+    +action : String
+    +entityType : String
+    +entityId : String
+    +reason : String
+    +oldValue : String?
+    +newValue : String?
+    +occurredAt : DateTime
+  }
+
+  class ConfigurationItem <<entity>> {
+    +key : String
+    +value : String
+    +updatedBy : UUID
+    +updatedAt : DateTime
+  }
+
+  class AuditService <<service>> {
+    +record(actorId : UUID, action : String, entityType : String, entityId : String, reason : String) : void
+  }
+
+  class ConfigurationService <<service>> {
+    +getDecimal(key : String) : Decimal
+    +getInteger(key : String) : Integer
+    +update(key : String, value : String, updatedBy : UUID) : void
+  }
+
+  class DailyStatistics <<value>> {
+    +reportDate : Date
+    +paymentCount : Integer
+    +feesEarned : Money
+    +commissionsPaid : Money
+    +failuresPerBiller : Map<String, Integer>
+  }
+}
+
+' ---------- Accounts and Wallet relations ----------
+Account "1" -- "1" Wallet : owns
+Account "1" -- "0..*" AccountBlock
+Account "0..1" -- "0..*" AccountBlock : blockedBy
+Wallet "1" *-- "0..*" LedgerEntry
+FinancialMovement "1" *-- "1..*" LedgerEntry : atomic ledger postings
+FinancialMovement ..> Payment : optional payment source
+FinancialMovement ..> TopUp : optional top-up source
+Wallet "1" -- "0..*" TopUp
+TopUp ..> CardPaymentGateway
+SimulatedCardGateway ..|> CardPaymentGateway
+WalletService ..> Wallet
+WalletService ..> LedgerEntry : appends
+AccountService ..> Account
+AccountService ..> AccountBlock
+
+' ---------- Biller Catalog relations ----------
+Biller "1" *-- "1..*" BillerService
+BillerService "1" *-- "0..*" ServiceInputField
+BillerCatalogService ..> Biller
+BillerCatalogService ..> BillerService
+
+' ---------- Payment Processing relations ----------
+Payment "1" --> "1" PaymentState : current state
+PaymentState <|-- InitiatedState
+PaymentState <|-- FundsHeldState
+PaymentState <|-- SentToBillerState
+PaymentState <|-- UnknownState
+PaymentState <|-- FailedState
+PaymentState <|-- CompletedState
+PaymentState <|-- RejectedState
+PaymentState <|-- RefundedState
+Payment "1" *-- "0..*" PaymentStatusHistory
+Payment "1" *-- "0..3" StatusInquiryAttempt
+Payment "1" -- "0..*" RefundRequest
+Payment ..> Account : customer and agent
+Payment ..> Wallet : walletId
+Payment ..> BillerService : billerServiceId
+
+PaymentEventPublisher "1" --> "0..*" PaymentEventListener : observers
+PaymentEventPublisher ..> PaymentEvent
+NotificationService ..|> PaymentEventListener
+
+InquireBillerStatusCommand ..|> PaymentCommand
+RetryScheduler "1" --> "0..*" PaymentCommand : schedules
+RetryScheduler ..> StatusInquiryAttempt
+InquireBillerStatusCommand ..> BillerAdapterFactory
+InquireBillerStatusCommand ..> PaymentService : applyBillerOutcome
+
+PaymentService ..> Payment
+PaymentService ..> PayBillRequest
+PaymentService ..> FraudRuleHandler : first rule of chain
+PaymentService ..> FeeCalculator
+PaymentService ..> CommissionCalculator
+PaymentService ..> WalletService
+PaymentService ..> AccountService
+PaymentService ..> BillerAdapterFactory
+PaymentService ..> PaymentEventPublisher
+PaymentService ..> RetryScheduler
+PaymentService ..> AuditService
+RefundService ..> RefundRequest
+RefundService ..> WalletService
+RefundService ..> AuditService
+
+' ---------- Biller Integration relations ----------
+BillerAdapter <|.. ElectroCoAdapter
+BillerAdapter <|.. AquaCoAdapter
+BillerAdapter <|.. TopUpNetAdapter
+BatchBillerAdapter <|.. NetCoBatchAdapter
+BillerAdapterFactory ..> BillerAdapter : selects
+BillerAdapterFactory ..> BatchBillerAdapter : selects
+BillerAdapterFactory ..> ConfigurationService : configured adapter registry
+BillerAdapter ..> BillInquiryResult
+BillerAdapter ..> BillerPaymentRequest
+BillerAdapter ..> BillerPaymentResult
+BillerPaymentResult ..> BillerOutcome
+TopUpNetAdapter ..> BillerCallbackLog : logs
+TopUpNetAdapter ..> AuditService : logs duplicate callbacks
+
+' ---------- Fees and Commissions relations ----------
+FeeStrategy <|.. FixedFeeStrategy
+FeeStrategy <|.. PercentageFeeStrategy
+FeeStrategy <|.. TieredFeeStrategy
+TieredFeeStrategy ..> FeeTier
+FeeRule "1" *-- "0..*" FeeTier
+FeeRule ..> BillerService
+Promotion ..> Biller
+FeeCalculator ..> FeeRule
+FeeCalculator ..> FeeStrategy : chooses
+FeeCalculator ..> Promotion
+FeeCalculator ..> FeeQuote
+CommissionCalculator ..> Commission
+
+' ---------- Fraud Checks relations ----------
+FraudRuleHandler "1" --> "0..1" FraudRuleHandler : next
+FraudRuleHandler <|-- AccountStatusRule
+FraudRuleHandler <|-- SingleLimitRule
+FraudRuleHandler <|-- DailyLimitRule
+FraudRuleHandler <|-- VelocityRule
+FraudRuleHandler ..> FraudCheckContext
+FraudRuleHandler ..> FraudDecision
+
+' ---------- Notifications relations ----------
+NotificationProvider <|.. SmsProvider
+NotificationProvider <|.. PushProvider
+NotificationProvider <|.. EmailProvider
+NotificationService ..> NotificationProvider
+NotificationService ..> Notification
+NotificationService ..> NotificationTemplate
+
+' ---------- Reconciliation relations ----------
+SettlementFile "1" *-- "0..*" SettlementRecord
+ReconciliationReport "1" *-- "0..*" ReconciliationDifference
+ReconciliationDifference ..> Payment : paymentId
+ReconciliationService ..> SettlementFile
+ReconciliationService ..> ReconciliationReport
+ReconciliationService ..> PaymentService : applyBillerOutcome
+
+' ---------- Audit and Configuration relations ----------
+AuditService ..> AuditLogEntry
+ConfigurationService ..> ConfigurationItem
+
+' ---------- Notes ----------
+note right of Money
+  All amounts use exact decimal values.
+  Money is used as an attribute type across modules;
+  the arrows are omitted to keep the diagram readable.
+end note
+
+note bottom of Wallet
+  No stored balance field.
+  Available and held balances are computed
+  from the sum of ledger entries per bucket.
+  Every financial operation has a unique FinancialMovement
+  idempotency key and may append multiple ledger entries.
+  A hold writes AVAILABLE negative and HELD positive postings.
+  Check and reserve against the ledger-derived available total
+  atomically; competing holds cannot reserve the same funds.
+end note
+
+note bottom of Account
+  Registration fields are not defined in the brief (AQ-01).
+  Agent authentication is not defined (AQ-04).
+  Role SYSTEM is PayLink's own fee-income account.
+end note
+
+note bottom of PaymentState
+  State pattern. Only the transitions of the brief are allowed.
+  Any other event is rejected with an invalid-transition error.
+  Every transition adds a PaymentStatusHistory row. Failed ->
+  Refunded occurs with successful hold release. Completed, Rejected
+  and Refunded are terminal; FR-27 does not add Completed -> Refunded.
+end note
+
+note bottom of RefundRequest
+  Refund of a Completed payment (FR-27).
+  Separate from the Failed to Refunded hold release,
+  which is a Failed -> Refunded transition plus a RELEASE movement.
+  On 2026-11-25 the user approved deferring FR-27 implementation
+  and method/amount/ledger definition until team/TA resolves AQ-07/AQ-12.
+  The user separately approved one authorized Support-role reviewer
+  and an audit record of actor, timestamp, outcome, reason, payment/refund
+  identifiers and any resulting ledger movement; no dual control is proposed.
+  Team/TA confirmation is pending; neither is team/TA approval. No
+  completed-refund method or state transition is approved.
+end note
+
+note bottom of InquireBillerStatusCommand
+  Command pattern. Re-queries the biller after
+  User-approved AQ-15 offsets (2026-11-25): 1, 5 and 15 minutes
+  from Unknown entry. Rationale: deterministic times from the start of
+  the unresolved state. This is user approval, not team/TA approval.
+  It never re-sends the payment.
+end note
+
+note bottom of FraudRuleHandler
+  Chain of Responsibility.
+  Order: AccountStatus, SingleLimit, DailyLimit, Velocity.
+  Limits and windows are read from ConfigurationService.
+  User-approved AQ-14 interpretation (2026-11-25): count payment initiation
+  attempts including those later rejected. This is user approval, not a claim
+  of team/TA approval. Rationale: prevent rapid activity evading the rule
+  through rejected outcomes. Daily limit composition remains open.
+  The caller builds FraudCheckContext and applies blockAccountUntil.
+end note
+
+note bottom of ElectroCoAdapter
+  Phase 2 API v2 change (field mapping, piaster conversion,
+  request signing) is confined to this adapter.
+end note
+
+note right of BillerService
+  Catalog fields include biller-specific inputs such as
+  ElectroCo meter number and TopUpNet phone number.
+end note
+
+note bottom of BillerAdapterFactory
+  Factory selects by biller code from the configured adapter registry.
+  Adding a biller means one new adapter plus registry/configuration;
+  unrelated modules and the payment workflow do not change.
+end note
+
+note bottom of TopUpNetAdapter
+  `accepted` is a pending integration result, not a payment state.
+  Payment stays SentToBiller until a definitive callback; callback
+  state changes are validated by PaymentState.
+end note
+
+note bottom of ConfigurationItem
+  Business rules live here, not in code:
+  daily limits, 5 and 10,000 payment range, fees,
+  40 percent commission, velocity rule, timeouts, retries.
+end note
+
+@enduml

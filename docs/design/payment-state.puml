@@ -1,0 +1,70 @@
+@startuml
+title PayLink - Payment State Diagram
+skinparam shadowing false
+hide empty description
+
+[*] --> Initiated : payment request accepted
+
+state Initiated
+state FundsHeld
+state SentToBiller
+state Unknown
+state Failed
+state Completed
+state Rejected
+state Refunded
+
+Initiated --> FundsHeld : fraud approved / funds available\n[hold succeeds]
+Initiated --> Rejected : fraud rejected or insufficient funds
+
+FundsHeld --> SentToBiller : submit payment to biller
+
+SentToBiller --> Completed : biller confirms success\n[capture held funds]
+SentToBiller --> Failed : biller definitively refuses
+SentToBiller --> Unknown : no response within 10 seconds\n[keep funds held]
+
+Unknown --> Completed : late callback / status inquiry /\nreconciliation confirms success\n[capture held funds]
+Unknown --> Failed : authoritative refusal or\nreconciliation confirms no payment
+
+Rejected --> [*]
+Completed --> [*]
+Failed --> Refunded : release held funds exactly once
+Refunded --> [*]
+
+note right of Initiated
+    Validate amount: 5..10,000 EGP.
+    Check account, daily limit and velocity.
+    User-approved AQ-14: velocity counts payment initiation attempts,
+    including attempts later rejected (2026-11-25).
+    Rationale: prevent rapid activity evading the rule through rejected outcomes.
+    Basic daily limit: 5,000 EGP.
+    Verified daily limit: 30,000 EGP.
+end note
+
+note right of Unknown
+    Funds remain held.
+    User-approved AQ-15 (2026-11-25): inquiries at +1, +5, +15 minutes from Unknown entry.
+    Rationale: deterministic retry times from the start of the unresolved state.
+    This records user approval, not team/TA approval.
+    Never resubmit the payment.
+    If still unresolved, remain Unknown until
+    definitive callback or reconciliation evidence.
+end note
+
+note bottom of Failed
+    A definitive failure enters Failed. The atomic hold release
+    then performs the required Failed -> Refunded transition.
+end note
+
+note bottom of Completed
+    Terminal under the official payment lifecycle. FR-27 is a
+    separate optional refund workflow; its effect on payment state
+    is unresolved (AQ-07) and must not add a lifecycle transition.
+end note
+
+note right of FundsHeld
+    Hold the full customer total: bill amount plus service fee.
+    Sara's example holds 352.50 EGP (350.00 + 2.50).
+end note
+
+@enduml
